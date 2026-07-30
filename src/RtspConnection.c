@@ -1132,6 +1132,32 @@ int performRtspHandshake(PSERVER_INFORMATION serverInfo) {
             SunshineFeatureFlags = 0;
         }
 
+        // Highest frame timestamp extension version the host can emit. Absent
+        // means a host that predates versioning, which can only emit v1.
+        //
+        // We do not act on this -- the version that matters is the one actually
+        // on the wire, which the depacketizer reads per frame -- but logging it
+        // next to our own maximum makes a mismatch diagnosable from the client
+        // log alone, rather than presenting as an unexplained empty host half of
+        // the trace. See artifacts/wire-contract-frame-trace.md §6.
+        if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.traceExtVersion", &HostFrameTraceExtVersion)) {
+            HostFrameTraceExtVersion = 0;
+        }
+        if (StreamConfig.latencyTraceEnabled) {
+            if (HostFrameTraceExtVersion == 0) {
+                Limelog("Latency trace: host advertises no frame trace extension version; "
+                        "it can only emit v1 (client supports up to v%u)\n",
+                        SS_FRAME_TIMESTAMP_EXT_VERSION);
+            }
+            else {
+                Limelog("Latency trace: host supports frame trace extension up to v%u, "
+                        "client up to v%u; expecting v%u on the wire\n",
+                        HostFrameTraceExtVersion, SS_FRAME_TIMESTAMP_EXT_VERSION,
+                        HostFrameTraceExtVersion < SS_FRAME_TIMESTAMP_EXT_VERSION
+                                ? HostFrameTraceExtVersion : SS_FRAME_TIMESTAMP_EXT_VERSION);
+            }
+        }
+
         // Look for the Sunshine encryption flags in the SDP attributes
         if (!parseSdpAttributeToUInt(response.payload, "x-ss-general.encryptionSupported", &EncryptionFeaturesSupported)) {
             EncryptionFeaturesSupported = 0;

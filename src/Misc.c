@@ -148,6 +148,18 @@ uint64_t LiGetMillis(void) {
     return PltGetMillis();
 }
 
+uint64_t LiGetMicros(void) {
+    return PltGetMicros();
+}
+
 uint32_t LiGetHostFeatureFlags(void) {
     return SunshineFeatureFlags;
+}
+
+bool LiGetLatencyTraceEnabled(void) {
+    return LatencyTraceEnabled;
+}
+
+uint8_t LiGetFrameTraceExtVersion(void) {
+    return getFrameTraceExtVersion();
 }

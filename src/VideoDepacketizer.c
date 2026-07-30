@@ -24,6 +24,20 @@ static unsigned int firstPacketPresentationTime;
 static bool dropStatePending;
 static bool idrFrameProcessed;
 
+// Latency trace state for the frame currently being reassembled (SPEC.md §3).
+// Owned exclusively by the video receive thread: set on the SOF packet, read and
+// cleared in reassembleFrame(). No other thread touches these.
+static bool frameTraceValid;
+static SS_FRAME_TIMESTAMP_EXT frameTraceExt;
+static uint64_t frameTraceLastPacketRxUs;
+static bool frameTraceLastPacketRxValid;
+
+// Version actually observed on the wire, plus once-per-session log latches so a
+// mismatch is reported without spamming a per-frame path.
+static uint8_t frameTraceNegotiatedVersion;
+static bool frameTraceVersionLogged;
+static bool frameTraceVersionMismatchLogged;
+
 #define DR_CLEANUP -1000
 
 #define CONSECUTIVE_DROP_LIMIT 120
@@ -76,6 +90,17 @@ void initializeVideoDepacketizer(int pktSize) {
     dropStatePending = false;
     idrFrameProcessed = false;
     strictIdrFrameWait = !isReferenceFrameInvalidationEnabled();
+
+    // Trace extension version state. These are file-scope statics and
+    // moonlight-common-c supports reconnecting in the same process, so a stale
+    // version from a previous host must not leak into this session's metadata.
+    frameTraceNegotiatedVersion = 0;
+    frameTraceVersionLogged = false;
+    frameTraceVersionMismatchLogged = false;
+}
+
+uint8_t getFrameTraceExtVersion(void) {
+    return frameTraceNegotiatedVersion;
 }
 
 // Free the NAL chain
@@ -494,6 +519,74 @@ static void reassembleFrame(int frameNumber) {
             qdu->decodeUnit.hdrActive = LiGetCurrentHostDisplayHdrMode();
             qdu->decodeUnit.colorspace = (uint8_t)(qdu->decodeUnit.hdrActive ? COLORSPACE_REC_2020 : StreamConfig.colorSpace);
 
+            // Latency trace (SPEC.md §3). Host timestamps are converted into the
+            // client's monotonic epoch here, on the receive thread, so the client
+            // never has to reason about two clocks. If no offset estimate is
+            // available the whole host half is dropped rather than guessed; the
+            // client-only t_last_packet_rx still goes out so the client-side
+            // stages remain measurable during clock sync warmup.
+            qdu->decodeUnit.traceValid = false;
+            qdu->decodeUnit.traceLastPacketRxValid = false;
+            qdu->decodeUnit.traceLastPacketRxUs = 0;
+            qdu->decodeUnit.traceHostCaptureRequestedUs = 0;
+            qdu->decodeUnit.traceHostCaptureCompleteUs = 0;
+            qdu->decodeUnit.traceHostEncodeSubmitUs = 0;
+            qdu->decodeUnit.traceHostEncodeCompleteUs = 0;
+            qdu->decodeUnit.traceHostTxPipelineEntryUs = 0;
+            qdu->decodeUnit.traceHostStampMask = 0;
+
+            if (LatencyTraceEnabled) {
+                qdu->decodeUnit.traceLastPacketRxUs = frameTraceLastPacketRxUs;
+                qdu->decodeUnit.traceLastPacketRxValid = frameTraceLastPacketRxValid;
+
+                if (frameTraceValid) {
+                    uint64_t converted;
+                    uint8_t mask = frameTraceExt.validityMask;
+                    uint8_t outMask = 0;
+
+                    // Per-field, not all-or-nothing. The host cannot stamp every
+                    // stage on every frame -- the synchronous capture path has no
+                    // request hook, and a repeated static-content frame has no
+                    // capture completion -- so requiring all five would empty the
+                    // host half of the trace on exactly those sessions.
+                    //
+                    // A field whose bit is clear is left alone: not converted, not
+                    // defaulted to zero, and never substituted from a neighbouring
+                    // stamp. It is emitted blank in the CSV.
+                    if ((mask & SS_STAMP_VALID_CAPTURE_REQUESTED) &&
+                            convertHostToClientMicros(frameTraceExt.captureRequestedUs, &converted)) {
+                        qdu->decodeUnit.traceHostCaptureRequestedUs = converted;
+                        outMask |= SS_STAMP_VALID_CAPTURE_REQUESTED;
+                    }
+                    if ((mask & SS_STAMP_VALID_CAPTURE_COMPLETE) &&
+                            convertHostToClientMicros(frameTraceExt.captureCompleteUs, &converted)) {
+                        qdu->decodeUnit.traceHostCaptureCompleteUs = converted;
+                        outMask |= SS_STAMP_VALID_CAPTURE_COMPLETE;
+                    }
+                    if ((mask & SS_STAMP_VALID_ENCODE_SUBMIT) &&
+                            convertHostToClientMicros(frameTraceExt.encodeSubmitUs, &converted)) {
+                        qdu->decodeUnit.traceHostEncodeSubmitUs = converted;
+                        outMask |= SS_STAMP_VALID_ENCODE_SUBMIT;
+                    }
+                    if ((mask & SS_STAMP_VALID_ENCODE_COMPLETE) &&
+                            convertHostToClientMicros(frameTraceExt.encodeCompleteUs, &converted)) {
+                        qdu->decodeUnit.traceHostEncodeCompleteUs = converted;
+                        outMask |= SS_STAMP_VALID_ENCODE_COMPLETE;
+                    }
+                    if ((mask & SS_STAMP_VALID_TX_PIPELINE_ENTRY) &&
+                            convertHostToClientMicros(frameTraceExt.txPipelineEntryUs, &converted)) {
+                        qdu->decodeUnit.traceHostTxPipelineEntryUs = converted;
+                        outMask |= SS_STAMP_VALID_TX_PIPELINE_ENTRY;
+                    }
+
+                    // traceValid means "the extension itself was sound and the
+                    // clock offset was available", not "every stage is present".
+                    // Per-stage presence is traceHostStampMask.
+                    qdu->decodeUnit.traceHostStampMask = outMask;
+                    qdu->decodeUnit.traceValid = true;
+                }
+            }
+
             // Invoke the key frame callback if needed
             if (nalChainHead->bufferType != BUFFER_TYPE_PICDATA || qdu->decodeUnit.frameType == FRAME_TYPE_IDR) {
                 qdu->decodeUnit.frameType = FRAME_TYPE_IDR;
@@ -824,6 +917,12 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         decodingFrame = true;
         frameType = FRAME_TYPE_PFRAME;
         firstPacketReceiveTime = receiveTimeMs;
+
+        // Clear last frame's trace so a frame whose host extension is missing,
+        // truncated or mismatched cannot inherit the previous frame's timestamps.
+        frameTraceValid = false;
+        frameTraceLastPacketRxUs = 0;
+        frameTraceLastPacketRxValid = false;
         
         // Some versions of Sunshine don't send a valid PTS, so we will
         // synthesize one using the receive time as the time base.
@@ -837,6 +936,22 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         else {
             firstPacketPresentationTime = presentationTimeMs;
         }
+    }
+
+    // SPEC.md §3 t_last_packet_rx.
+    //
+    // This MUST be sampled after the firstPacket block above, not before it. A
+    // frame small enough to fit in one RTP packet carries FLAG_SOF and FLAG_EOF
+    // together, so firstPacket and lastPacket are both true in this single
+    // invocation; sampling first would have the SOF reset immediately zero it.
+    // Single-packet P-frames are common on a static screen, so that would have
+    // silently blanked a large fraction of rows.
+    //
+    // Validity is carried explicitly rather than by testing for zero, because a
+    // zero here is indistinguishable from a real value to the consumer.
+    if (LatencyTraceEnabled && lastPacket) {
+        frameTraceLastPacketRxUs = PltGetMicros();
+        frameTraceLastPacketRxValid = true;
     }
 
     lastPacketInStream = streamPacketIndex;
@@ -904,15 +1019,34 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             BbGet16(&bb, &lastPacketPayloadLength);
         }
 
+        // The Apollo 2.0 latency trace appends a SS_FRAME_TIMESTAMP_EXT to the
+        // stock frame header and signals it with the stock discriminator plus
+        // one (0x01 -> 0x02, 0x81 -> 0x82). Subtract to recover the stock value
+        // so the version cascade below is unchanged, then skip the extension
+        // after the stock header size has been determined.
+        //
+        // The extension is always skipped correctly if it is present, even when
+        // the trace is disabled locally. Only reading the timestamps is gated on
+        // LatencyTraceEnabled. That way a host that keeps emitting the extension
+        // after a mid-session capability change degrades to "no trace data"
+        // instead of desynchronising the bitstream.
+        uint8_t frameHdrDisc = (uint8_t)currentPos.data[0];
+        bool frameHdrHasTraceExt = false;
+        if (frameHdrDisc == FRAME_HDR_DISC_SHORT_TRACE || frameHdrDisc == FRAME_HDR_DISC_LONG_TRACE) {
+            // 0x02 -> 0x01 and 0x82 -> 0x81.
+            frameHdrHasTraceExt = true;
+            frameHdrDisc -= 1;
+        }
+
         if (APP_VERSION_AT_LEAST(7, 1, 450)) {
             // >= 7.1.450 uses 2 different header lengths based on the first byte:
             // 0x01 indicates an 8 byte header
             // 0x81 indicates a 44 byte header
-            if (currentPos.data[0] == 0x01) {
+            if (frameHdrDisc == FRAME_HDR_DISC_SHORT) {
                 frameHeaderSize = 8;
             }
             else {
-                LC_ASSERT_VT(currentPos.data[0] == (char)0x81);
+                LC_ASSERT_VT(frameHdrDisc == FRAME_HDR_DISC_LONG);
                 frameHeaderSize = 44;
             }
         }
@@ -920,11 +1054,11 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             // [7.1.446, 7.1.450) uses 2 different header lengths based on the first byte:
             // 0x01 indicates an 8 byte header
             // 0x81 indicates a 41 byte header
-            if (currentPos.data[0] == 0x01) {
+            if (frameHdrDisc == FRAME_HDR_DISC_SHORT) {
                 frameHeaderSize = 8;
             }
             else {
-                LC_ASSERT_VT(currentPos.data[0] == (char)0x81);
+                LC_ASSERT_VT(frameHdrDisc == FRAME_HDR_DISC_LONG);
                 frameHeaderSize = 41;
             }
         }
@@ -932,11 +1066,11 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             // [7.1.415, 7.1.446) uses 2 different header lengths based on the first byte:
             // 0x01 indicates an 8 byte header
             // 0x81 indicates a 24 byte header
-            if (currentPos.data[0] == 0x01) {
+            if (frameHdrDisc == FRAME_HDR_DISC_SHORT) {
                 frameHeaderSize = 8;
             }
             else {
-                LC_ASSERT_VT(currentPos.data[0] == (char)0x81);
+                LC_ASSERT_VT(frameHdrDisc == FRAME_HDR_DISC_LONG);
                 frameHeaderSize = 24;
             }
         }
@@ -955,6 +1089,93 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         else {
             // Other versions don't have a frame header at all
             frameHeaderSize = 0;
+        }
+
+        // Parse the latency trace extension, which sits between the stock frame
+        // header and the picture data. Any validation failure means we skip the
+        // trace for this frame but still consume the bytes, so the bitstream
+        // stays intact.
+        if (frameHdrHasTraceExt) {
+            if (currentPos.length < frameHeaderSize + sizeof(SS_FRAME_TIMESTAMP_EXT)) {
+                // The discriminator promised an extension that does not fit. We
+                // cannot locate the picture data, so the frame is unusable.
+                //
+                // Note the length assert further down does NOT catch this: it
+                // only checks against the stock header size, which any length
+                // between stock and stock+47 satisfies. Dropping the frame state
+                // explicitly is the actual handling.
+                Limelog("Frame %d: truncated latency trace extension (%u < %u); dropping frame\n",
+                        frameIndex, currentPos.length,
+                        (unsigned int)(frameHeaderSize + sizeof(SS_FRAME_TIMESTAMP_EXT)));
+                frameTraceValid = false;
+                dropFrameState();
+                return;
+            }
+            else {
+                if (LatencyTraceEnabled) {
+                    SS_FRAME_TIMESTAMP_EXT ext;
+
+                    // memcpy because the extension is not guaranteed to be aligned
+                    // within the packet buffer.
+                    memcpy(&ext, currentPos.data + currentPos.offset + frameHeaderSize, sizeof(ext));
+
+                    ext.frameIndex = LE32(ext.frameIndex);
+                    ext.captureRequestedUs = LE64(ext.captureRequestedUs);
+                    ext.captureCompleteUs = LE64(ext.captureCompleteUs);
+                    ext.encodeSubmitUs = LE64(ext.encodeSubmitUs);
+                    ext.encodeCompleteUs = LE64(ext.encodeCompleteUs);
+                    ext.txPipelineEntryUs = LE64(ext.txPipelineEntryUs);
+
+                    if (ext.extVersion == 0 || ext.extVersion > SS_FRAME_TIMESTAMP_EXT_VERSION) {
+                        // A host speaking a version we do not understand. Ignore
+                        // the contents rather than misinterpreting them; the
+                        // struct size is fixed by contract so the picture data is
+                        // still located correctly below.
+                        //
+                        // This used to be silent, which made a version mismatch
+                        // present as "every host column is empty" with no
+                        // diagnostic anywhere on either side. Log it once per
+                        // session rather than per frame.
+                        if (!frameTraceVersionMismatchLogged) {
+                            frameTraceVersionMismatchLogged = true;
+                            Limelog("Latency trace: host is emitting frame timestamp extension v%u "
+                                    "but this client understands at most v%u; host columns will be "
+                                    "empty for this session\n",
+                                    ext.extVersion, SS_FRAME_TIMESTAMP_EXT_VERSION);
+                        }
+                        frameTraceValid = false;
+                    }
+                    else if (ext.frameIndex != frameIndex) {
+                        // The echo did not match, so this extension does not belong
+                        // to this frame. Never emit a row joined on the wrong id.
+                        Limelog("Frame %d: latency trace extension frame index mismatch (%u)\n",
+                                frameIndex, ext.frameIndex);
+                        frameTraceValid = false;
+                    }
+                    else {
+                        // v1 predates validityMask and always sent that byte as
+                        // zero, so an unpatched host would otherwise look like it
+                        // had no stamps at all. v1 implicitly means all five are
+                        // present, which is what v1 actually guaranteed.
+                        if (ext.extVersion < 2) {
+                            ext.validityMask = SS_STAMP_VALID_ALL;
+                        }
+                        ext.validityMask &= SS_STAMP_VALID_ALL;
+
+                        frameTraceExt = ext;
+                        frameTraceValid = true;
+
+                        if (!frameTraceVersionLogged) {
+                            frameTraceVersionLogged = true;
+                            frameTraceNegotiatedVersion = ext.extVersion;
+                            Limelog("Latency trace: host is emitting frame timestamp extension v%u\n",
+                                    ext.extVersion);
+                        }
+                    }
+                }
+
+                frameHeaderSize += (uint32_t)sizeof(SS_FRAME_TIMESTAMP_EXT);
+            }
         }
 
         LC_ASSERT_VT(currentPos.length >= frameHeaderSize);

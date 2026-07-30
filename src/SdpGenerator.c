@@ -269,8 +269,35 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+
+        // Only advertise the latency trace when the client actually wants it.
+        // The host keys its frame header format off this bit, so advertising it
+        // unconditionally would make every stock session carry trace overhead.
+        if (StreamConfig.latencyTraceEnabled) {
+            moonlightFeatureFlags |= ML_FF_LATENCY_TRACE;
+        }
+
         snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
+
+        // Advertise the highest frame timestamp extension version we understand,
+        // so the host can emit the highest version both sides support.
+        //
+        // ML_FF_LATENCY_TRACE alone only says "I understand the extension", which
+        // became ambiguous the moment there were two incompatible meanings of the
+        // same 48 bytes. Without a version the only symptom of a mismatch is an
+        // entirely empty host half of the trace, with no diagnostic on either
+        // side, and the struct-size rule that keeps a mismatch from corrupting
+        // the bitstream stays an unenforceable social convention.
+        //
+        // A host that does not understand this attribute ignores it and keeps
+        // emitting v1, which this client still parses. A client that does not
+        // send it is treated by the host as v1 for the same reason. Both
+        // directions degrade to v1 rather than to silence.
+        if (StreamConfig.latencyTraceEnabled) {
+            snprintf(payloadStr, sizeof(payloadStr), "%u", SS_FRAME_TIMESTAMP_EXT_VERSION);
+            err |= addAttributeString(&optionHead, "x-ml-general.traceExtVersion", payloadStr);
+        }
 
         // New-style control stream encryption is low overhead, so we enable it any time it is supported
         if (EncryptionFeaturesSupported & SS_ENC_CONTROL_V2) {

@@ -148,4 +148,8 @@ int initializePlatform(void);
 void cleanupPlatform(void);
 
 uint64_t PltGetMillis(void);
+
+// Monotonic microsecond clock used by the latency trace. Millisecond resolution
+// is too coarse to attribute pipeline stages at an 8.333 ms frame interval.
+uint64_t PltGetMicros(void);
 bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src);

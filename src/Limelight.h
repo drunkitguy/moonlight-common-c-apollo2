@@ -95,6 +95,13 @@ typedef struct _STREAM_CONFIGURATION {
     // enabled.
     int encryptionFlags;
 
+    // Set to a non-zero value to request the per-frame latency trace described
+    // in the Apollo 2.0 spec. This is off by default and costs nothing when off:
+    // no capability is advertised, no clock sync traffic is sent, and no
+    // per-frame timestamps are parsed. It only takes effect if the host also
+    // advertises support, so an unpatched host silently leaves it disabled.
+    int latencyTraceEnabled;
+
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
     // in /launch and /resume requests.
@@ -187,6 +194,45 @@ typedef struct _DECODE_UNIT {
     // Note: This is not currently parsed from the actual bitstream, so if your
     // client has access to a bitstream parser, prefer that over this field.
     uint8_t colorspace;
+
+    // True when the fields below carry a valid host-side latency trace for this
+    // frame. False whenever the trace is disabled, the host did not attach an
+    // extension to this frame, the extension failed validation, or no clock
+    // offset estimate was available to convert the host timestamps. Always check
+    // this before reading any traceHost* field.
+    bool traceValid;
+
+    // Which of the host stamps below are actually present, as SS_STAMP_VALID_*
+    // bits. The host cannot stamp every stage on every frame, and zero is a legal
+    // monotonic timestamp, so this mask is the only way to tell "not measured"
+    // from "measured as zero". A field whose bit is clear holds no meaning and
+    // must not be read, defaulted or interpolated. Only meaningful when
+    // traceValid is true.
+    uint8_t traceHostStampMask;
+
+    // Host pipeline timestamps for this frame, already converted into the same
+    // monotonic microsecond epoch as traceLastPacketRxUs below, so they can be
+    // subtracted directly. Each is meaningful only when traceValid is true AND
+    // its bit is set in traceHostStampMask.
+    uint64_t traceHostCaptureRequestedUs;
+    uint64_t traceHostCaptureCompleteUs;
+    uint64_t traceHostEncodeSubmitUs;
+    uint64_t traceHostEncodeCompleteUs;
+
+    // Host transmit-pipeline entry, NOT first-packet transmit time. The frame
+    // header is inside the FEC-protected payload, so the host stamps this before
+    // parity, encryption and pacing. Do not compute one-way delay from it.
+    uint64_t traceHostTxPipelineEntryUs;
+
+    // True when traceLastPacketRxUs below holds a real sample. Independent of
+    // traceValid, because the client-side receive timestamp needs no host clock
+    // and no offset estimate to be meaningful. Check this rather than testing
+    // traceLastPacketRxUs against zero.
+    bool traceLastPacketRxValid;
+
+    // Client monotonic microsecond timestamp of the final packet of this frame.
+    // Only meaningful when traceLastPacketRxValid is true.
+    uint64_t traceLastPacketRxUs;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
@@ -565,6 +611,32 @@ const char* LiGetStageName(int stage);
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
 
+// Returns the current state of the latency trace clock offset estimator. Any
+// output pointer may be NULL. offsetUs is the host clock minus the client clock
+// in microseconds; bestRttUs is the round trip of the minimum-RTT sample that
+// produced the current estimate; sampleCount and divergenceEvents are session
+// cumulative counters for the trace metadata block.
+//
+// Returns false when no usable estimate exists, which is the case before the
+// first sample lands, when the trace is disabled, and immediately after a clock
+// discontinuity is detected. Callers must not join host and client timestamps
+// while this returns false.
+//
+// Safe to call from any thread between LiStartConnection() and LiStopConnection().
+bool LiGetClockSyncInfo(int64_t* offsetUs, uint32_t* bestRttUs, uint32_t* sampleCount, uint32_t* divergenceEvents, uint32_t* unmatchedResponses);
+
+// Returns true if the per-frame latency trace was successfully negotiated with
+// the host for this session. Always false when the client did not request it.
+bool LiGetLatencyTraceEnabled(void);
+
+// Returns the frame timestamp extension version actually observed on the wire
+// this session, or 0 if no valid extension has been parsed yet -- which is also
+// what you get when the host declined the capability or is emitting a version
+// this client does not understand. Record it alongside any trace output; a
+// joined dataset that does not carry the format version cannot be interpreted
+// later.
+uint8_t LiGetFrameTraceExtVersion(void);
+
 // This function sends a request to the server to execute the requested cmd id.
 int LiSendExecServerCmd(uint8_t cmdId);
 
@@ -842,6 +914,11 @@ int LiSendHighResHScrollEvent(short scrollAmount);
 
 // This function returns a time in milliseconds with an implementation-defined epoch.
 uint64_t LiGetMillis(void);
+
+// Monotonic microsecond clock on the same epoch as the DECODE_UNIT trace fields.
+// Millisecond resolution is too coarse to attribute pipeline stages at a 120 Hz
+// frame interval, so the latency trace uses this instead of LiGetMillis().
+uint64_t LiGetMicros(void);
 
 // This is a simplistic STUN function that can assist clients in getting the WAN address
 // for machines they find using mDNS over IPv4. This can be used to pre-populate the external

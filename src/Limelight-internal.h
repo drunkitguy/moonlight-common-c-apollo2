@@ -44,6 +44,12 @@ extern uint32_t ControlConnectData;
 
 extern uint32_t SunshineFeatureFlags;
 
+// Highest frame timestamp extension version the host advertised in DESCRIBE
+// (x-ss-general.traceExtVersion), or 0 if it advertised none. Diagnostic only:
+// the authoritative version is the one on each extension. Written once during
+// the RTSP handshake, before any thread that reads it starts.
+extern uint32_t HostFrameTraceExtVersion;
+
 // Encryption flags shared by Sunshine and Moonlight in RTSP
 #define SS_ENC_CONTROL_V2 0x01
 #define SS_ENC_VIDEO 0x02
@@ -88,6 +94,19 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+#define ML_FF_LATENCY_TRACE 0x04 // Client understands SS_FRAME_TIMESTAMP_EXT and the clock sync messages
+
+// Host feature flags in x-ss-general.featureFlags. These must match the host's
+// platform_caps constants (Apollo: src/platform/common.h).
+#define SS_FF_PEN_TOUCH_EVENTS 0x01
+#define SS_FF_CONTROLLER_TOUCH_EVENTS 0x02
+#define SS_FF_LATENCY_TRACE 0x04 // Host emits SS_FRAME_TIMESTAMP_EXT and answers clock sync
+
+// True only when BOTH peers advertised the latency trace capability and the
+// client enabled it in STREAM_CONFIGURATION. Read on the video receive thread
+// and the control threads; written once during connection setup before any of
+// those threads start, so it needs no synchronisation after startup.
+extern bool LatencyTraceEnabled;
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -126,6 +145,17 @@ void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
 void flushInputOnControlStream(void);
 bool isControlDataInTransit(void);
+
+// Converts a host CLOCK_MONOTONIC timestamp to the client's monotonic epoch
+// using the current clock offset estimate. Returns false when no valid estimate
+// exists yet, when the estimate has been invalidated by divergence, or when the
+// conversion would underflow. Callers must drop the sample when this returns
+// false rather than emitting a garbage value.
+bool convertHostToClientMicros(uint64_t hostUs, uint64_t* clientUs);
+
+// Frame timestamp extension version observed on the wire this session, 0 if none.
+// Video receive thread writes it once; read at session end for the trace metadata.
+uint8_t getFrameTraceExtVersion(void);
 
 int performRtspHandshake(PSERVER_INFORMATION serverInfo);
 

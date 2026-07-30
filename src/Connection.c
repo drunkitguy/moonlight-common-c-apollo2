@@ -33,6 +33,7 @@ SS_PING AudioPingPayload;
 SS_PING VideoPingPayload;
 uint32_t ControlConnectData;
 uint32_t SunshineFeatureFlags;
+uint32_t HostFrameTraceExtVersion;
 uint32_t EncryptionFeaturesSupported;
 uint32_t EncryptionFeaturesRequested;
 uint32_t EncryptionFeaturesEnabled;
@@ -436,6 +437,25 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
     LC_ASSERT(stage == STAGE_RTSP_HANDSHAKE);
     ListenerCallbacks.stageComplete(STAGE_RTSP_HANDSHAKE);
     Limelog("done\n");
+
+    // Resolve the latency trace capability now that the host's feature flags are
+    // known from the RTSP handshake. This must happen before the control and
+    // video threads start, because they read LatencyTraceEnabled without a lock.
+    //
+    // The trace requires all three of: the client asking for it, the host being
+    // a Sunshine/Apollo derivative, and the host advertising support. Any peer
+    // that does not know about the feature simply leaves it off, in both
+    // directions, with no wire-format change at all.
+    LatencyTraceEnabled = StreamConfig.latencyTraceEnabled != 0 &&
+                          IS_SUNSHINE() &&
+                          (SunshineFeatureFlags & SS_FF_LATENCY_TRACE) != 0;
+    if (StreamConfig.latencyTraceEnabled && !LatencyTraceEnabled) {
+        Limelog("Latency trace requested but not supported by host (flags 0x%x); continuing without it\n",
+                SunshineFeatureFlags);
+    }
+    else if (LatencyTraceEnabled) {
+        Limelog("Latency trace negotiated with host\n");
+    }
 
     Limelog("Initializing control stream...");
     ListenerCallbacks.stageStarting(STAGE_CONTROL_STREAM_INIT);

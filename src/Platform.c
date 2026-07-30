@@ -437,6 +437,42 @@ uint64_t PltGetMillis(void) {
 #endif
 }
 
+// Microsecond resolution monotonic clock for the latency trace (SPEC.md §3).
+// This must never be a wall clock: it is differenced across a session and must
+// not jump when NTP or the user adjusts the system time.
+uint64_t PltGetMicros(void) {
+#if defined(LC_WINDOWS)
+    LARGE_INTEGER counter;
+    static LARGE_INTEGER frequency;
+
+    // QueryPerformanceFrequency is fixed at boot, so caching it is safe.
+    if (frequency.QuadPart == 0) {
+        QueryPerformanceFrequency(&frequency);
+        if (frequency.QuadPart == 0) {
+            return PltGetMillis() * 1000;
+        }
+    }
+
+    QueryPerformanceCounter(&counter);
+
+    // Split the division to avoid overflowing the multiply on long uptimes.
+    return ((uint64_t)(counter.QuadPart / frequency.QuadPart) * 1000000) +
+           ((uint64_t)(counter.QuadPart % frequency.QuadPart) * 1000000 / frequency.QuadPart);
+#elif defined(CLOCK_MONOTONIC) && !defined(NO_CLOCK_GETTIME)
+    struct timespec tv;
+
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+
+    return ((uint64_t)tv.tv_sec * 1000000) + (tv.tv_nsec / 1000);
+#else
+    struct timeval tv;
+
+    gettimeofday(&tv, NULL);
+
+    return ((uint64_t)tv.tv_sec * 1000000) + tv.tv_usec;
+#endif
+}
+
 bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src) {
     LC_ASSERT(dest_size > 0);
 

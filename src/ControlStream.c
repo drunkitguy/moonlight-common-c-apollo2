@@ -113,6 +113,76 @@ static int lastConnectionStatusUpdate;
 static uint32_t currentEnetSequenceNumber;
 static uint64_t firstFrameTimeMs;
 
+// --- Clock offset estimation (SPEC.md §3) --------------------------------
+//
+// NTP-style four-timestamp exchange with minimum-RTT sample selection.
+//
+// Thread ownership: requests are sent from the loss stats thread; responses are
+// parsed and folded in on the control receive thread; convertHostToClientMicros()
+// is called from the video receive thread.
+//
+// Every variable declared in the block below is shared across those threads and
+// is accessed only under clockSyncMutex. The mutex is held for a few arithmetic
+// operations at a time and never while blocking, so it cannot serialise the
+// video path in any meaningful way.
+//
+// The one exception is clockSyncLastRequestTimeMs, which is declared separately
+// further down precisely because it is NOT shared: only the loss stats thread
+// ever reads or writes it, so it needs no lock.
+//
+// When LatencyTraceEnabled is false nothing here runs at all: no requests are
+// sent, no mutex is taken, and the video path never calls the converter.
+#define CLOCK_SYNC_WINDOW_SIZE 16
+#define CLOCK_SYNC_WARMUP_INTERVAL_MS 250
+#define CLOCK_SYNC_STEADY_INTERVAL_MS 2000
+#define CLOCK_SYNC_WARMUP_SAMPLES 8
+
+// A shift larger than this between the incumbent estimate and a fresh minimum-RTT
+// estimate is treated as a clock discontinuity rather than as noise. 50 ms is far
+// above any plausible LAN scheduling jitter and far below anything we could
+// tolerate silently in a trace measured against an 8.333 ms frame interval.
+#define CLOCK_SYNC_DIVERGENCE_THRESHOLD_US 50000
+
+// Samples with an RTT above this are discarded outright. On a Wi-Fi link a
+// badly delayed pong carries almost no information about the true offset.
+#define CLOCK_SYNC_MAX_USABLE_RTT_US 100000
+
+// Number of clock sync requests we remember so a response can be matched back
+// to a request we actually sent. Two in flight is the realistic maximum at the
+// warmup cadence; 8 leaves margin for a stalled link without unbounded state.
+#define CLOCK_SYNC_OUTSTANDING_SIZE 8
+
+typedef struct _CLOCK_SYNC_SAMPLE {
+    uint64_t rttUs;
+    int64_t offsetUs; // host clock minus client clock
+    bool valid;
+} CLOCK_SYNC_SAMPLE, *PCLOCK_SYNC_SAMPLE;
+
+typedef struct _CLOCK_SYNC_OUTSTANDING {
+    uint32_t sequenceNumber;
+    uint64_t clientTxUs;
+    bool valid;
+} CLOCK_SYNC_OUTSTANDING, *PCLOCK_SYNC_OUTSTANDING;
+
+static PLT_MUTEX clockSyncMutex;
+static CLOCK_SYNC_SAMPLE clockSyncWindow[CLOCK_SYNC_WINDOW_SIZE];
+static int clockSyncWindowPos;
+static CLOCK_SYNC_OUTSTANDING clockSyncOutstanding[CLOCK_SYNC_OUTSTANDING_SIZE];
+static int clockSyncOutstandingPos;
+static uint32_t clockSyncNextSequenceNumber;
+static uint32_t clockSyncUnmatchedResponses;
+static uint32_t clockSyncSamplesAccepted;
+static uint32_t clockSyncDivergenceEvents;
+static int64_t clockSyncCurrentOffsetUs;
+static uint64_t clockSyncCurrentRttUs;
+static bool clockSyncOffsetValid;
+
+// Loss stats thread only. Deliberately outside the mutex-guarded block above:
+// no other thread reads or writes it, so locking it would be pure ceremony.
+static uint64_t clockSyncLastRequestTimeMs;
+
+bool LatencyTraceEnabled;
+
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
 static LINKED_BLOCKING_QUEUE asyncCallbackQueue;
@@ -326,6 +396,23 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&frameFecStatusQueue, 8); // Limits number of frame status reports per periodic ping interval
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
+    PltCreateMutex(&clockSyncMutex);
+
+    // Reset clock sync state for this connection. These are file-scope statics
+    // and moonlight-common-c supports reconnecting in the same process, so they
+    // must not carry over an offset estimated against a previous host.
+    memset(clockSyncWindow, 0, sizeof(clockSyncWindow));
+    memset(clockSyncOutstanding, 0, sizeof(clockSyncOutstanding));
+    clockSyncWindowPos = 0;
+    clockSyncOutstandingPos = 0;
+    clockSyncUnmatchedResponses = 0;
+    clockSyncNextSequenceNumber = 0;
+    clockSyncLastRequestTimeMs = 0;
+    clockSyncSamplesAccepted = 0;
+    clockSyncDivergenceEvents = 0;
+    clockSyncCurrentOffsetUs = 0;
+    clockSyncCurrentRttUs = 0;
+    clockSyncOffsetValid = false;
 
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
 
@@ -394,6 +481,10 @@ static void freeBasicLbqList(PLINKED_BLOCKING_QUEUE_ENTRY entry) {
 // Cleans up control stream
 void destroyControlStream(void) {
     LC_ASSERT(stopping);
+
+    // Clear this before the mutex goes away so LiGetClockSyncInfo() cannot lock
+    // a destroyed mutex if it is called late.
+    LatencyTraceEnabled = false;
     PltDestroyCryptoContext(encryptionCtx);
     PltDestroyCryptoContext(decryptionCtx);
     PltCloseEvent(&idrFrameRequiredEvent);
@@ -402,6 +493,7 @@ void destroyControlStream(void) {
     freeBasicLbqList(LbqDestroyLinkedBlockingQueue(&asyncCallbackQueue));
 
     PltDeleteMutex(&enetMutex);
+    PltDeleteMutex(&clockSyncMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -1101,6 +1193,238 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
     }
 }
 
+// Discards every accumulated sample. Called on a detected clock discontinuity,
+// where every stored offset is now known to be wrong. Caller holds clockSyncMutex.
+static void resetClockSyncWindowLocked(void) {
+    memset(clockSyncWindow, 0, sizeof(clockSyncWindow));
+    clockSyncWindowPos = 0;
+    clockSyncOffsetValid = false;
+}
+
+// Sends one clock sync request. Called from the loss stats thread only.
+static void sendClockSyncRequest(void) {
+    SS_CLOCK_SYNC_REQUEST request;
+    uint32_t seq;
+    uint64_t txUs;
+
+    // Sample the clock as late as possible so the send path is inside the RTT
+    // rather than hidden before t1.
+    txUs = PltGetMicros();
+
+    PltLockMutex(&clockSyncMutex);
+    seq = clockSyncNextSequenceNumber++;
+
+    // Record the request so the response can be matched back to something we
+    // actually sent, rather than trusting the echoed t1.
+    clockSyncOutstanding[clockSyncOutstandingPos].sequenceNumber = seq;
+    clockSyncOutstanding[clockSyncOutstandingPos].clientTxUs = txUs;
+    clockSyncOutstanding[clockSyncOutstandingPos].valid = true;
+    clockSyncOutstandingPos = (clockSyncOutstandingPos + 1) % CLOCK_SYNC_OUTSTANDING_SIZE;
+    PltUnlockMutex(&clockSyncMutex);
+
+    request.sequenceNumber = LE32(seq);
+    request.reserved = 0;
+    request.clientTxUs = LE64(txUs);
+
+    // Reliable: a lost request just wastes a slot. Reordering and duplication
+    // are handled by the sequence number match in handleClockSyncResponse().
+    // Reliability keeps the sample rate predictable, which matters for warmup.
+    sendMessageAndForget(SS_CLOCK_SYNC_REQUEST_PTYPE, sizeof(request), &request,
+                         CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_RELIABLE, false);
+}
+
+// Folds one completed four-timestamp exchange into the estimate.
+// Called from the control receive thread only.
+static void handleClockSyncResponse(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    SS_CLOCK_SYNC_RESPONSE response;
+    uint64_t t1, t2, t3, t4;
+    uint64_t rttUs;
+    int64_t offsetUs;
+    int bestIndex;
+    int i;
+
+    // A short packet means a peer that does not implement this correctly. Drop
+    // it rather than reading past the end of the allocation.
+    if (packetLength < (int)(sizeof(*ctlHdr) + sizeof(response))) {
+        Limelog("Discarding runt clock sync response: %d\n", packetLength);
+        return;
+    }
+
+    memcpy(&response, ((char*)ctlHdr) + sizeof(*ctlHdr), sizeof(response));
+
+    t1 = LE64(response.clientTxUs);
+    t2 = LE64(response.hostRxUs);
+    t3 = LE64(response.hostTxUs);
+    t4 = PltGetMicros();
+
+    // Match the response against a request we actually sent. Without this a
+    // host echoing an arbitrary t1 would be taken at face value, and a
+    // duplicated response would be folded in twice. The matched entry is
+    // consumed so a replay cannot be counted again.
+    {
+        uint32_t seq = LE32(response.sequenceNumber);
+        bool matched = false;
+        int i;
+
+        PltLockMutex(&clockSyncMutex);
+        for (i = 0; i < CLOCK_SYNC_OUTSTANDING_SIZE; i++) {
+            if (clockSyncOutstanding[i].valid &&
+                    clockSyncOutstanding[i].sequenceNumber == seq &&
+                    clockSyncOutstanding[i].clientTxUs == t1) {
+                clockSyncOutstanding[i].valid = false;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            clockSyncUnmatchedResponses++;
+        }
+        PltUnlockMutex(&clockSyncMutex);
+
+        if (!matched) {
+            Limelog("Discarding unmatched clock sync response (seq %u)\n", seq);
+            return;
+        }
+    }
+
+    // t1 is echoed from our own monotonic clock, so t4 < t1 is impossible unless
+    // the host corrupted the echo. t3 < t2 means the host's own clock went
+    // backwards between receive and send. Either way the sample is unusable.
+    if (t4 < t1 || t3 < t2) {
+        Limelog("Discarding nonsensical clock sync sample\n");
+        return;
+    }
+
+    // rtt = total elapsed on our clock, minus the interval the host held it.
+    // Both terms are non-negative per the check above, but the host interval can
+    // still exceed our round trip if the host echoed a bogus t1.
+    if ((t3 - t2) > (t4 - t1)) {
+        Limelog("Discarding clock sync sample with negative computed RTT\n");
+        return;
+    }
+    rttUs = (t4 - t1) - (t3 - t2);
+
+    if (rttUs > CLOCK_SYNC_MAX_USABLE_RTT_US) {
+        // Too noisy to carry information. Not an error; just drop it.
+        return;
+    }
+
+    // offset = host clock - client clock, averaged over the two directions.
+    // Computed in int64 because the two clocks have unrelated epochs and the
+    // difference is routinely larger than any individual timestamp difference.
+    offsetUs = (((int64_t)t2 - (int64_t)t1) + ((int64_t)t3 - (int64_t)t4)) / 2;
+
+    PltLockMutex(&clockSyncMutex);
+
+    clockSyncWindow[clockSyncWindowPos].rttUs = rttUs;
+    clockSyncWindow[clockSyncWindowPos].offsetUs = offsetUs;
+    clockSyncWindow[clockSyncWindowPos].valid = true;
+    clockSyncWindowPos = (clockSyncWindowPos + 1) % CLOCK_SYNC_WINDOW_SIZE;
+    clockSyncSamplesAccepted++;
+
+    // Minimum-RTT selection over the sliding window, per SPEC.md §3. The lowest
+    // RTT sample is the one least contaminated by queueing in either direction.
+    // Using a window rather than an all-time minimum means a single freakishly
+    // fast early sample cannot pin the estimate for the whole session.
+    bestIndex = -1;
+    for (i = 0; i < CLOCK_SYNC_WINDOW_SIZE; i++) {
+        if (!clockSyncWindow[i].valid) {
+            continue;
+        }
+        if (bestIndex < 0 || clockSyncWindow[i].rttUs < clockSyncWindow[bestIndex].rttUs) {
+            bestIndex = i;
+        }
+    }
+
+    if (bestIndex >= 0) {
+        int64_t candidateOffsetUs = clockSyncWindow[bestIndex].offsetUs;
+
+        if (clockSyncOffsetValid) {
+            int64_t delta = candidateOffsetUs - clockSyncCurrentOffsetUs;
+            if (delta < 0) {
+                delta = -delta;
+            }
+
+            if (delta > CLOCK_SYNC_DIVERGENCE_THRESHOLD_US) {
+                // Either clock stepped. Every stored sample straddles the step
+                // and is now meaningless, so throw the window away and rebuild
+                // it. Until it refills, the trace stops emitting host-joined
+                // rows rather than emitting wrong ones.
+                clockSyncDivergenceEvents++;
+                Limelog("Clock offset diverged by %lld us (event %u); resetting estimate\n",
+                        (long long)delta, clockSyncDivergenceEvents);
+                resetClockSyncWindowLocked();
+                PltUnlockMutex(&clockSyncMutex);
+                return;
+            }
+        }
+
+        clockSyncCurrentOffsetUs = candidateOffsetUs;
+        clockSyncCurrentRttUs = clockSyncWindow[bestIndex].rttUs;
+        clockSyncOffsetValid = true;
+    }
+
+    PltUnlockMutex(&clockSyncMutex);
+}
+
+bool convertHostToClientMicros(uint64_t hostUs, uint64_t* clientUs) {
+    int64_t converted;
+    bool valid;
+
+    if (!LatencyTraceEnabled) {
+        return false;
+    }
+
+    PltLockMutex(&clockSyncMutex);
+    valid = clockSyncOffsetValid;
+    converted = (int64_t)hostUs - clockSyncCurrentOffsetUs;
+    PltUnlockMutex(&clockSyncMutex);
+
+    if (!valid) {
+        return false;
+    }
+
+    // A non-positive result means the offset and the host timestamp disagree so
+    // badly that the frame appears to predate the client's boot. Refuse rather
+    // than wrapping into a huge unsigned value.
+    if (converted <= 0) {
+        return false;
+    }
+
+    *clientUs = (uint64_t)converted;
+    return true;
+}
+
+bool LiGetClockSyncInfo(int64_t* offsetUs, uint32_t* bestRttUs, uint32_t* sampleCount, uint32_t* divergenceEvents, uint32_t* unmatchedResponses) {
+    bool valid;
+
+    // destroyControlStream() clears LatencyTraceEnabled before deleting the
+    // mutex, so this check also keeps a late caller from locking a destroyed
+    // mutex. The call must still happen before LiStopConnection() completes;
+    // this is a backstop, not a licence to call it afterwards.
+    if (!LatencyTraceEnabled) {
+        return false;
+    }
+
+    PltLockMutex(&clockSyncMutex);
+    valid = clockSyncOffsetValid;
+    if (offsetUs != NULL) {
+        *offsetUs = clockSyncCurrentOffsetUs;
+    }
+    if (bestRttUs != NULL) {
+        *bestRttUs = (uint32_t)clockSyncCurrentRttUs;
+    }
+    if (sampleCount != NULL) {
+        *sampleCount = clockSyncSamplesAccepted;
+    }
+    if (divergenceEvents != NULL) {
+        *divergenceEvents = clockSyncDivergenceEvents;
+    }
+    PltUnlockMutex(&clockSyncMutex);
+
+    return valid;
+}
+
 static void controlReceiveThreadFunc(void* context) {
     int err;
 
@@ -1292,6 +1616,16 @@ static void controlReceiveThreadFunc(void* context) {
                 hdrEnabled = (enableByte != 0);
             }
 
+            // Clock sync responses are folded in on this thread. The work is a
+            // handful of integer operations under a dedicated mutex, so it does
+            // not warrant the async callback thread, and handling it here keeps
+            // t4 as close to the actual receive as possible.
+            if (LatencyTraceEnabled && ctlHdr->type == (unsigned short)SS_CLOCK_SYNC_RESPONSE_PTYPE) {
+                handleClockSyncResponse(ctlHdr, packetLength);
+                free(ctlHdr);
+                continue;
+            }
+
             // Process client callbacks in a separate thread
             if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
@@ -1436,6 +1770,30 @@ static void lossStatsThreadFunc(void* context) {
                 Limelog("Loss Stats: Transaction failed: %d\n", (int)LastSocketError());
                 ListenerCallbacks.connectionTerminated(LastSocketFail());
                 return;
+            }
+
+            // Piggyback the latency trace clock sync on this existing tick rather
+            // than spawning another thread. Sampling fast during warmup gets the
+            // minimum-RTT window populated quickly; after that a slow cadence is
+            // enough to track drift between two monotonic clocks.
+            if (LatencyTraceEnabled) {
+                uint64_t nowMs = PltGetMillis();
+                uint32_t samples;
+                uint64_t intervalMs;
+
+                PltLockMutex(&clockSyncMutex);
+                samples = clockSyncSamplesAccepted;
+                PltUnlockMutex(&clockSyncMutex);
+
+                intervalMs = samples < CLOCK_SYNC_WARMUP_SAMPLES
+                    ? CLOCK_SYNC_WARMUP_INTERVAL_MS
+                    : CLOCK_SYNC_STEADY_INTERVAL_MS;
+
+                if (clockSyncLastRequestTimeMs == 0 ||
+                        nowMs - clockSyncLastRequestTimeMs >= intervalMs) {
+                    clockSyncLastRequestTimeMs = nowMs;
+                    sendClockSyncRequest();
+                }
             }
 
             // Wait a bit
