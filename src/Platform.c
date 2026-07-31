@@ -437,8 +437,9 @@ uint64_t PltGetMillis(void) {
 #endif
 }
 
-// Microsecond resolution monotonic clock for the latency trace (SPEC.md §3).
-// This must never be a wall clock: it is differenced across a session and must
+// Microsecond resolution monotonic clock, used by the latency trace (SPEC.md §3)
+// and by the adaptive late-frame tolerance estimator (SPEC.md §4 Item C).
+// This must never be a wall clock: both difference it across a session and must
 // not jump when NTP or the user adjusts the system time.
 uint64_t PltGetMicros(void) {
 #if defined(LC_WINDOWS)

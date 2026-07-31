@@ -149,7 +149,9 @@ void cleanupPlatform(void);
 
 uint64_t PltGetMillis(void);
 
-// Monotonic microsecond clock used by the latency trace. Millisecond resolution
-// is too coarse to attribute pipeline stages at an 8.333 ms frame interval.
+// Monotonic microsecond clock, used by both the latency trace and the adaptive
+// late-frame tolerance estimator. Millisecond resolution is too coarse either to
+// attribute pipeline stages or to measure inter-arrival jitter against an
+// 8.333 ms frame interval.
 uint64_t PltGetMicros(void);
 bool PltSafeStrcpy(char* dest, size_t dest_size, const char* src);

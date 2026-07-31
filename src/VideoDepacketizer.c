@@ -37,6 +37,122 @@ static bool frameTraceLastPacketRxValid;
 static uint8_t frameTraceNegotiatedVersion;
 static bool frameTraceVersionLogged;
 static bool frameTraceVersionMismatchLogged;
+// --- Adaptive jitter buffer (SPEC.md §4 Item C) ---------------------------
+//
+// There is no jitter measurement anywhere in this tree today. RtpVideoQueue has
+// no time-based hold and no depth bound, and the renderer's two "adaptive" drop
+// thresholds read an EWMA that is initialised once to a fraction of the vsync
+// period and never assigned again. So this starts by actually measuring.
+//
+// What is measured: per-FRAME inter-arrival, not per-packet. RtpVideoQueue
+// deliberately stamps every packet in a frame with the first packet's receive
+// time, so per-packet arrival information does not survive to here.
+//
+// The client is on Wi-Fi and the host is wired, so essentially all observed
+// jitter originates on the client's wireless leg or the AP. It is modelled as a
+// single-sided noise source: only late arrivals matter, because an early frame
+// costs nothing. Spread is measured upward from the window median rather than as
+// an absolute deviation, which would let a burst of early frames inflate it.
+//
+// The baseline is the MEDIAN OF THE MEASURED WINDOW, not the requested frame
+// rate. Measuring against StreamConfig.fps would report a host that delivers 60
+// while 120 was requested as ~8.3 ms of "jitter" on every single frame, forever,
+// on a perfectly clean link. That is a frame-rate mismatch, not jitter, and no
+// amount of buffering fixes it. Against the median it correctly reads as zero.
+//
+// Sizing is a high percentile minus that median, not a mean or an EWMA:
+// wireless inter-arrival is heavy-tailed, and a mean of a heavy-tailed
+// distribution under-buffers exactly when buffering matters.
+//
+// The target is the sum of two components, so that the percentile actually
+// governs rather than being overridden:
+//
+//   percentile component - p95 minus median, recomputed every 16 frames, decays
+//                          by a bounded step. This is the steady-state level.
+//   fast bump            - a bounded transient raised by a single late frame or
+//                          a detected loss, halved every recompute.
+//
+// An earlier version let a single frame set the whole target. That is
+// running-maximum-with-a-slow-leak, not a percentile: one 25 ms sample pinned
+// the target for 6.6 s at the 500 us/recompute leak, during which ~800 frames
+// could re-pin it, so on any link with a spike every few seconds the statistic
+// never governed at all. Capping the transient and decaying it separately keeps
+// the onset response without letting one sample own the control law.
+//
+// Response is still asymmetric per SPEC.md §4 Item C -- both components rise
+// faster than they fall -- because on a wireless link oscillation is worse than
+// a slightly oversized tolerance.
+//
+// Thread ownership: every variable below is touched only by the video receive
+// thread, inside processRtpPayload() and reassembleFrame(). Nothing else reads
+// or writes them. The value crosses to Java on the decode unit, which is already
+// a per-frame handoff, so no shared-state read is needed for display either.
+#define JITTER_WINDOW_SIZE 128
+#define JITTER_RECOMPUTE_INTERVAL 16
+#define JITTER_PERCENTILE_NUM 95
+#define JITTER_PERCENTILE_DEN 100
+
+// How far the target may fall per recompute. At 120 fps a recompute happens
+// roughly every 133 ms, so this decays about 3.75 ms per second: fast enough to
+// recover after a transient, slow enough not to chase noise back down.
+#define JITTER_RAMP_DOWN_STEP_US 500
+
+// A detected frame loss forces the target up by this much immediately, on the
+// theory that loss on a wireless link is a leading indicator of a jitter burst
+// that the percentile window has not caught up with yet.
+#define JITTER_LOSS_BUMP_US 2000
+
+// An inter-arrival gap beyond this multiple of the current baseline is a stall,
+// a stream restart or a pause, not jitter. Such samples are DISCARDED, not
+// clamped: clamping them to the ceiling made them arithmetically identical to an
+// unbounded outlier, so seven of them inside one window would pin the percentile
+// at the ceiling and then take seconds to decay.
+#define JITTER_STALL_MULTIPLE 4
+
+// The stall test is self-referential -- its threshold comes from the baseline,
+// and the baseline is the median of samples the test admitted. A sustained
+// degradation past the multiple (120 fps collapsing to 24) would otherwise
+// discard every sample forever: the window would never update, the baseline
+// would never move, and the estimator would freeze, blind and silent, on exactly
+// the degradation it exists to notice.
+//
+// So after this many consecutive discards the gap is reinterpreted as the new
+// normal rather than a stall: the window is cleared and the baseline re-anchored
+// to the current interval. That is the escape hatch that breaks the loop.
+#define JITTER_STALL_ESCAPE_COUNT 16
+
+// Nothing above this is ever admitted as an inter-arrival sample, whatever the
+// baseline says. Bounds the re-anchor path so a multi-second pause cannot become
+// the new baseline.
+#define JITTER_MAX_SANE_INTERVAL_US 1000000
+
+// The transient bump a single late frame or a loss may contribute. Bounding it
+// is what keeps the percentile in charge: an unbounded per-frame maximum turns
+// the control law into running-max-with-leak, and the window, the sort and the
+// p95 index all become decorative.
+#define JITTER_FAST_BUMP_MAX_US 8000
+
+// Hard ceiling regardless of configuration.
+#define JITTER_TARGET_CEILING_US 50000
+
+static uint32_t jitterDeltaWindowUs[JITTER_WINDOW_SIZE];
+static uint32_t jitterScratchUs[JITTER_WINDOW_SIZE];
+static int jitterWindowCount;
+static int jitterWindowPos;
+static int jitterFramesSinceRecompute;
+static int jitterConsecutiveStalls;
+static uint64_t jitterLastFrameArrivalUs;
+static uint32_t jitterNominalIntervalUs; // startup seed only, until the window fills
+static uint32_t jitterBaselineUs;        // measured median inter-arrival
+static uint32_t jitterMeasuredUs;        // p95 spread above the baseline
+static uint32_t jitterPercentileTargetUs; // slow, percentile-governed component
+static uint32_t jitterFastBumpUs;        // bounded, fast-decaying transient
+static uint32_t jitterTargetUs;          // sum of the two, clamped to the ceiling
+static uint32_t jitterTargetCeilingUs;
+static uint32_t jitterLossEvents;
+static uint32_t jitterStallsDiscarded;
+static uint32_t jitterReanchors;
+static bool jitterAdaptiveEnabled;
 
 #define DR_CLEANUP -1000
 
@@ -97,10 +213,237 @@ void initializeVideoDepacketizer(int pktSize) {
     frameTraceNegotiatedVersion = 0;
     frameTraceVersionLogged = false;
     frameTraceVersionMismatchLogged = false;
+
+    // Adaptive jitter buffer. Disabled unless the caller opts in, so the default
+    // configuration is byte-identical to stock: no measurement, no added delay.
+    memset(jitterDeltaWindowUs, 0, sizeof(jitterDeltaWindowUs));
+    jitterWindowCount = 0;
+    jitterWindowPos = 0;
+    jitterFramesSinceRecompute = 0;
+    jitterConsecutiveStalls = 0;
+    jitterLastFrameArrivalUs = 0;
+    jitterBaselineUs = 0;
+    jitterMeasuredUs = 0;
+    jitterPercentileTargetUs = 0;
+    jitterFastBumpUs = 0;
+    jitterTargetUs = 0;
+    jitterLossEvents = 0;
+    jitterStallsDiscarded = 0;
+    jitterReanchors = 0;
+    jitterAdaptiveEnabled = StreamConfig.adaptiveLateFrameToleranceMaxMs > 0;
+    jitterTargetCeilingUs = jitterAdaptiveEnabled
+            ? (uint32_t)StreamConfig.adaptiveLateFrameToleranceMaxMs * 1000u : 0;
+    if (jitterTargetCeilingUs > JITTER_TARGET_CEILING_US) {
+        jitterTargetCeilingUs = JITTER_TARGET_CEILING_US;
+    }
+    // Startup seed for the stall test only. Once the window has samples the
+    // baseline comes from their median, never from the requested rate.
+    jitterNominalIntervalUs = (StreamConfig.fps >= 10 && StreamConfig.fps <= 1000)
+            ? (uint32_t)(1000000 / StreamConfig.fps) : 16667;
+    if (jitterAdaptiveEnabled) {
+        Limelog("Adaptive late-frame tolerance enabled: ceiling %u us, startup interval %u us\n",
+                jitterTargetCeilingUs, jitterNominalIntervalUs);
+    }
 }
 
 uint8_t getFrameTraceExtVersion(void) {
     return frameTraceNegotiatedVersion;
+}
+
+// Recombines the two components into the value the renderer consumes.
+// Video receive thread only.
+static void updateJitterTarget(void) {
+    uint32_t combined = jitterPercentileTargetUs + jitterFastBumpUs;
+
+    if (combined > jitterTargetCeilingUs) {
+        combined = jitterTargetCeilingUs;
+    }
+    jitterTargetUs = combined;
+}
+
+// Raises the bounded transient. Video receive thread only.
+static void addJitterFastBump(uint32_t bumpUs) {
+    if (bumpUs > JITTER_FAST_BUMP_MAX_US) {
+        bumpUs = JITTER_FAST_BUMP_MAX_US;
+    }
+    if (bumpUs > jitterFastBumpUs) {
+        jitterFastBumpUs = bumpUs;
+    }
+    updateJitterTarget();
+}
+
+// Recomputes the percentile and moves the target toward it. Video receive
+// thread only. Called once every JITTER_RECOMPUTE_INTERVAL frames rather than
+// per frame: sorting 128 entries at 7.5 Hz is free, doing it at 120 Hz is not.
+static void recomputeJitterTarget(void) {
+    int count = jitterWindowCount;
+    int i, j, medianIdx, pctIdx;
+    uint32_t desired;
+
+    if (count < 4) {
+        // Too few samples for a median to mean anything.
+        return;
+    }
+
+    memcpy(jitterScratchUs, jitterDeltaWindowUs, sizeof(uint32_t) * (size_t)count);
+
+    // Insertion sort. The window is small and nearly sorted in practice, so
+    // this beats anything with a call overhead per comparison.
+    for (i = 1; i < count; i++) {
+        uint32_t key = jitterScratchUs[i];
+        for (j = i - 1; j >= 0 && jitterScratchUs[j] > key; j--) {
+            jitterScratchUs[j + 1] = jitterScratchUs[j];
+        }
+        jitterScratchUs[j + 1] = key;
+    }
+
+    // Baseline is the median inter-arrival actually observed, so a steady rate
+    // below the requested one contributes nothing to measured jitter.
+    medianIdx = count / 2;
+    jitterBaselineUs = jitterScratchUs[medianIdx];
+
+    pctIdx = (count * JITTER_PERCENTILE_NUM) / JITTER_PERCENTILE_DEN;
+    if (pctIdx >= count) {
+        pctIdx = count - 1;
+    }
+
+    // Single-sided spread: how much later than typical the slow tail runs.
+    jitterMeasuredUs = (jitterScratchUs[pctIdx] > jitterBaselineUs)
+            ? (jitterScratchUs[pctIdx] - jitterBaselineUs) : 0;
+
+    desired = jitterMeasuredUs;
+    if (desired > jitterTargetCeilingUs) {
+        desired = jitterTargetCeilingUs;
+    }
+
+    if (desired > jitterPercentileTargetUs) {
+        // Ramp up immediately.
+        jitterPercentileTargetUs = desired;
+    }
+    else if (jitterPercentileTargetUs > desired) {
+        // Ramp down slowly.
+        uint32_t delta = jitterPercentileTargetUs - desired;
+        jitterPercentileTargetUs -= (delta > JITTER_RAMP_DOWN_STEP_US)
+                ? JITTER_RAMP_DOWN_STEP_US : delta;
+    }
+
+    // The transient decays far faster than the percentile component, so it can
+    // cover the onset of a burst without ever becoming the steady-state level.
+    jitterFastBumpUs /= 2;
+
+    updateJitterTarget();
+}
+
+// Feeds one completed frame's arrival into the estimator.
+// Video receive thread only.
+static void updateJitterEstimate(uint64_t arrivalUs) {
+    uint64_t deltaUs;
+    uint32_t baselineUs;
+    uint32_t latenessUs;
+
+    if (!jitterAdaptiveEnabled) {
+        return;
+    }
+
+    if (jitterLastFrameArrivalUs == 0 || arrivalUs <= jitterLastFrameArrivalUs) {
+        // First frame of the session, or a non-advancing clock. Neither yields
+        // a usable interval.
+        jitterLastFrameArrivalUs = arrivalUs;
+        return;
+    }
+
+    deltaUs = arrivalUs - jitterLastFrameArrivalUs;
+    jitterLastFrameArrivalUs = arrivalUs;
+
+    // Until the window has enough samples for a median, fall back to the
+    // nominal interval purely as a startup seed for the stall test.
+    baselineUs = (jitterBaselineUs != 0) ? jitterBaselineUs : jitterNominalIntervalUs;
+
+    // Discard stalls outright rather than clamping them. A clamped sample is
+    // still the largest value in the window and still drags the percentile up;
+    // an earlier version clamped to the ceiling, which made a stall exactly as
+    // damaging as an unbounded outlier.
+    //
+    // But the test cannot be trusted indefinitely, because its threshold comes
+    // from a baseline built only out of samples it admitted. If the real rate
+    // drops past the multiple and stays there, every sample looks like a stall
+    // forever and the estimator freezes. So a run of consecutive discards is
+    // taken as evidence that the baseline itself is wrong, and the window is
+    // re-anchored to the observed interval.
+    if (deltaUs > (uint64_t)baselineUs * JITTER_STALL_MULTIPLE) {
+        jitterStallsDiscarded++;
+
+        if (++jitterConsecutiveStalls < JITTER_STALL_ESCAPE_COUNT) {
+            return;
+        }
+
+        // Sustained: treat it as the new normal, not a stall.
+        if (deltaUs > JITTER_MAX_SANE_INTERVAL_US) {
+            // A pause or a suspend rather than a rate change. Do not let it
+            // become the baseline; wait for something plausible.
+            jitterConsecutiveStalls = 0;
+            return;
+        }
+
+        jitterConsecutiveStalls = 0;
+        jitterWindowCount = 0;
+        jitterWindowPos = 0;
+        jitterBaselineUs = (uint32_t)deltaUs;
+        jitterReanchors++;
+        Limelog("Jitter estimator re-anchored to %u us after %d sustained long intervals\n",
+                jitterBaselineUs, JITTER_STALL_ESCAPE_COUNT);
+        baselineUs = jitterBaselineUs;
+        // Fall through and admit this sample as the first of the new window.
+    }
+    else {
+        jitterConsecutiveStalls = 0;
+    }
+
+    jitterDeltaWindowUs[jitterWindowPos] = (uint32_t)deltaUs;
+    jitterWindowPos = (jitterWindowPos + 1) % JITTER_WINDOW_SIZE;
+    if (jitterWindowCount < JITTER_WINDOW_SIZE) {
+        jitterWindowCount++;
+    }
+
+    // Per-frame onset response. Waiting for the percentile alone means waiting
+    // for ~7 late frames plus up to a recompute interval, 100-200 ms of
+    // unprotected stream at the start of a burst, and pure Wi-Fi jitter arrives
+    // with no loss at all so the loss bump is not a fast path for it.
+    //
+    // This feeds the BOUNDED transient, not the target directly. Letting one
+    // sample set the target outright made the percentile decorative; capped and
+    // fast-decaying, it covers the onset and then gets out of the way.
+    latenessUs = (deltaUs > baselineUs) ? (uint32_t)(deltaUs - baselineUs) : 0;
+    if (latenessUs > 0) {
+        addJitterFastBump(latenessUs);
+    }
+
+    if (++jitterFramesSinceRecompute >= JITTER_RECOMPUTE_INTERVAL) {
+        jitterFramesSinceRecompute = 0;
+        recomputeJitterTarget();
+    }
+}
+
+// Fast ramp-up on observed loss. Video receive thread only.
+static void notifyJitterLoss(void) {
+    if (!jitterAdaptiveEnabled) {
+        return;
+    }
+
+    jitterLossEvents++;
+    addJitterFastBump(jitterFastBumpUs + JITTER_LOSS_BUMP_US);
+}
+
+// Reports frame loss to the host and feeds the jitter estimator's fast path.
+//
+// These are wrapped together so they cannot drift apart. The estimator
+// originally hooked one of the six paths that detect loss, so the mechanism the
+// design called its fast path was absent from the majority of the cases that
+// trigger it -- including the corrupt-frame path, which on a lossy wireless link
+// is at least as common as a whole-frame gap.
+static void reportFrameLoss(uint32_t startFrame, uint32_t endFrame) {
+    notifyJitterLoss();
+    connectionDetectedFrameLoss(startFrame, endFrame);
 }
 
 // Free the NAL chain
@@ -173,6 +516,24 @@ void stopVideoDepacketizer(void) {
 
 // Cleanup video depacketizer and free malloced memory
 void destroyVideoDepacketizer(void) {
+    // Summarise the estimator once, at teardown, so its counters have a real
+    // consumer rather than being incremented and never read.
+    //
+    // In particular a non-zero reanchor count, or a stall count that is a large
+    // fraction of the session, is the signature of the baseline having gone
+    // stale -- the failure mode the escape hatch in updateJitterEstimate()
+    // exists to break. Without this line that could happen for a whole session
+    // with no diagnostic anywhere. It is one log line at teardown, never during
+    // the stream, so it cannot perturb what it reports.
+    if (jitterAdaptiveEnabled) {
+        Limelog("Late-frame tolerance summary: baseline %u us, p95 spread %u us, "
+                "final tolerance %u us (percentile %u + transient %u), "
+                "loss bumps %u, long intervals discarded %u, re-anchors %u\n",
+                jitterBaselineUs, jitterMeasuredUs, jitterTargetUs,
+                jitterPercentileTargetUs, jitterFastBumpUs,
+                jitterLossEvents, jitterStallsDiscarded, jitterReanchors);
+    }
+
     freeDecodeUnitList(LbqDestroyLinkedBlockingQueue(&decodeUnitQueue));
     cleanupFrameState();
 }
@@ -511,6 +872,17 @@ static void reassembleFrame(int frameNumber) {
             qdu->decodeUnit.receiveTimeMs = firstPacketReceiveTime;
             qdu->decodeUnit.presentationTimeMs = firstPacketPresentationTime;
             qdu->decodeUnit.enqueueTimeMs = LiGetMillis();
+
+            // Adaptive late-frame tolerance. The frame is fully assembled here,
+            // so this is the arrival instant the estimator wants.
+            //
+            // The tolerance is carried on the decode unit rather than enforced
+            // here. Sleeping on this thread would stall FEC processing for
+            // packets already in flight, which on a lossy wireless link is
+            // precisely the wrong trade. The renderer applies it by widening its
+            // own stale-frame threshold; nothing is delayed anywhere.
+            updateJitterEstimate(PltGetMicros());
+            qdu->decodeUnit.lateFrameToleranceUs = jitterTargetUs;
 
             // These might be wrong for a few frames during a transition between SDR and HDR,
             // but the effects shouldn't very noticable since that's an infrequent operation.
@@ -880,7 +1252,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
             LiRequestIdrFrame();
         }
         else {
-            connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+            reportFrameLoss(startFrameNumber, frameIndex);
         }
         return;
     }
@@ -902,6 +1274,10 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                         nextFrameNumber,
                         frameIndex - 1);
             }
+
+            // Fast ramp-up: loss on a wireless link usually precedes a jitter
+            // burst that the percentile window has not seen yet.
+            notifyJitterLoss();
 
             nextFrameNumber = frameIndex;
 
@@ -996,7 +1372,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
         else {
             // Hope for the best with older servers
             if (waitingForRefInvalFrame) {
-                connectionDetectedFrameLoss(startFrameNumber, frameIndex - 1);
+                reportFrameLoss(startFrameNumber, frameIndex - 1);
                 waitingForRefInvalFrame = false;
                 waitingForNextSuccessfulFrame = false;
             }
@@ -1271,7 +1647,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                     LiRequestIdrFrame();
                 }
                 else {
-                    connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+                    reportFrameLoss(startFrameNumber, frameIndex);
                 }
 
                 return;
@@ -1305,7 +1681,7 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
                 // If we need an RFI frame first, then drop this frame
                 // and update the reference frame invalidation window.
                 Limelog("Waiting for RFI frame\n");
-                connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+                reportFrameLoss(startFrameNumber, frameIndex);
             }
 
             waitingForNextSuccessfulFrame = false;
@@ -1365,7 +1741,7 @@ void notifyFrameLost(unsigned int frameNumber, bool speculative) {
         nextFrameNumber = frameNumber + 1;
 
         // Notify the host that we lost this one
-        connectionDetectedFrameLoss(startFrameNumber, frameNumber);
+        reportFrameLoss(startFrameNumber, frameNumber);
     }
 }
 

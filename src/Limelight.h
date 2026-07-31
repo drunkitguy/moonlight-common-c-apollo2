@@ -116,6 +116,24 @@ typedef struct _STREAM_CONFIGURATION {
     // which simply zero this structure keep the stock behaviour.
     int inputBatchingIntervalMs;
 
+    // Upper bound, in milliseconds, on the extra frame lateness the client will
+    // tolerate before discarding a frame as stale (SPEC.md §4 Item C). Zero
+    // disables the feature entirely, which is the default and is byte-identical
+    // to stock behaviour: nothing is measured and no tolerance is added.
+    //
+    // This is a TOLERANCE, not a presentation delay. Nothing is delayed. When
+    // non-zero, the client measures per-frame inter-arrival, sizes a tolerance
+    // at a high percentile of the observed spread, and widens its own
+    // stale-frame threshold by that amount, so a frame late by less than the
+    // measured jitter is presented instead of dropped.
+    //
+    // It is a ceiling, not a floor: on a clean link the measured tolerance
+    // settles at zero and the feature costs nothing. Above zero it trades
+    // steady-state end-to-end latency for frame retention, because the discard
+    // it suppresses is also the pipeline's backlog-drain mechanism. Values above
+    // 50 are clamped.
+    int adaptiveLateFrameToleranceMaxMs;
+
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
     // in /launch and /resume requests.
@@ -247,6 +265,21 @@ typedef struct _DECODE_UNIT {
     // Client monotonic microsecond timestamp of the final packet of this frame.
     // Only meaningful when traceLastPacketRxValid is true.
     uint64_t traceLastPacketRxUs;
+
+    // Additional lateness, in microseconds, that the renderer should tolerate
+    // before discarding a frame as stale (SPEC.md §4 Item C). Sized from measured
+    // inter-arrival jitter. Zero when the feature is disabled.
+    //
+    // This is a TOLERANCE, not a delay. It must be added to whatever staleness
+    // threshold the renderer already applies; it must NOT be added to the
+    // presentation time. Delaying presentation by a constant does not reduce
+    // jitter -- a delay line preserves variance exactly -- and in a pipeline that
+    // also discards stale frames it makes things strictly worse, because the
+    // added delay pushes frames toward the discard threshold.
+    //
+    // A renderer that owns a real playout clock and a frame queue may instead
+    // spend it as queue depth, which is what it means there.
+    uint32_t lateFrameToleranceUs;
 } DECODE_UNIT, *PDECODE_UNIT;
 
 // Specifies that the audio stream should be encoded in stereo (default)
