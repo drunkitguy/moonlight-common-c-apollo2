@@ -55,9 +55,49 @@ static struct {
 // per millisecond, we'll wait a little bit to try to batch with
 // the next one. This batching wait paradoxically _decreases_
 // effective input latency by avoiding packet queuing in ENet.
-#define CONTROLLER_BATCHING_INTERVAL_MS 1
-#define MOUSE_BATCHING_INTERVAL_MS 1
-#define PEN_BATCHING_INTERVAL_MS 1
+//
+// The interval is a runtime tunable rather than a constant so a low-latency LAN
+// deployment can trade packet rate for immediacy. It is deliberately NOT
+// removable in spirit: the rate limit exists to bound the packet rate a
+// 1000 Hz mouse would otherwise produce, and on a congested or wireless link
+// that bound is what keeps ENet from queuing.
+//
+// Default remains 1 ms, unchanged from upstream, because SPEC.md §5.4 forbids
+// changing it on reasoning alone. What the default actually costs:
+//
+//   - At or below 1000 Hz the limiter never engages, because a device polling
+//     at 1000 Hz produces at most one event per millisecond.
+//   - Above 1000 Hz it engages on every event after the first in each window.
+//     An 8 kHz mouse, which is ordinary consumer hardware now, coalesces 7 of
+//     every 8 samples and the surviving sample waits up to 1 ms. That is 12% of
+//     an 8.333 ms frame interval, spent on the client before the packet leaves.
+//
+// Coalescing itself is not the problem: LiSendMouseMoveEvent() accumulates into
+// currentRelativeMouseState, so motion is merged, not dropped. The wait is the
+// cost, and it is a real one at high polling rates.
+//
+// KNOWN LIMITATION, not fixed here. lastMousePacketTime,
+// lastControllerPacketTime[n] and lastPenPacketTime are separate deadlines, but
+// all four batching branches call PltSleepMs() on the single input send thread.
+// A mouse-triggered sleep therefore also delays any queued controller, pen or
+// keyboard packet behind it. On a handheld with built-in sticks plus an
+// external high-polling-rate mouse, controller input inherits the mouse's wait.
+// Fixing it means sleeping until the earliest per-device deadline rather than
+// the current packet's, which restructures the queue loop; that is deliberately
+// not attempted without a device to measure it on.
+//
+// So the default stays at 1 ms until the SPEC.md §3 harness produces a run.
+//
+// 0 disables the wait entirely (send strictly on arrival). Values are clamped
+// to [0, INPUT_BATCHING_INTERVAL_MAX_MS] to keep a bad config from making input
+// unusable.
+#define INPUT_BATCHING_INTERVAL_DEFAULT_MS 1
+#define INPUT_BATCHING_INTERVAL_MAX_MS 16
+
+// Effective interval for this connection, resolved once in
+// initializeInputStream() from StreamConfig. Written before the input send
+// thread is created and read-only afterwards, so it needs no synchronisation.
+static uint64_t inputBatchingIntervalMs;
 
 // Don't batch up/down/cancel events
 #define TOUCH_EVENT_IS_BATCHABLE(x) ((x) == LI_TOUCH_EVENT_HOVER || (x) == LI_TOUCH_EVENT_MOVE)
@@ -103,6 +143,26 @@ int initializeInputStream(void) {
 
     cryptoContext = PltCreateCryptoContext();
     encryptedControlStream = APP_VERSION_AT_LEAST(7, 1, 431);
+
+    // Resolve the batching interval for this connection.
+    //
+    // Zero means "unset", not "no batching". LiInitializeStreamConfiguration()
+    // memsets the struct, so every existing caller leaves this field at zero and
+    // must keep getting the stock 1 ms behaviour. Disabling batching is spelled
+    // as a negative value precisely so it cannot happen by omission.
+    if (StreamConfig.inputBatchingIntervalMs == 0) {
+        inputBatchingIntervalMs = INPUT_BATCHING_INTERVAL_DEFAULT_MS;
+    }
+    else if (StreamConfig.inputBatchingIntervalMs < 0) {
+        inputBatchingIntervalMs = 0;
+    }
+    else {
+        inputBatchingIntervalMs = (uint64_t)CLAMP(StreamConfig.inputBatchingIntervalMs,
+                                                  1, INPUT_BATCHING_INTERVAL_MAX_MS);
+    }
+    if (inputBatchingIntervalMs != INPUT_BATCHING_INTERVAL_DEFAULT_MS) {
+        Limelog("Input batching interval set to %u ms\n", (unsigned int)inputBatchingIntervalMs);
+    }
 
     // FIXME: Unsure if this is exactly right, but it's probably good enough.
     //
@@ -355,9 +415,9 @@ static void inputSendThreadProc(void* context) {
             LC_ASSERT(controllerNumber < MAX_GAMEPADS);
 
             // Delay for batching if required
-            if (now < lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS) {
+            if (now < lastControllerPacketTime[controllerNumber] + inputBatchingIntervalMs) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastControllerPacketTime[controllerNumber] + CONTROLLER_BATCHING_INTERVAL_MS - now));
+                PltSleepMs((int)(lastControllerPacketTime[controllerNumber] + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
             }
 
@@ -413,9 +473,9 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMillis();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            if (now < lastMousePacketTime + inputBatchingIntervalMs) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
+                PltSleepMs((int)(lastMousePacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
             }
 
@@ -484,9 +544,9 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMillis();
 
             // Delay for batching if required
-            if (now < lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS) {
+            if (now < lastMousePacketTime + inputBatchingIntervalMs) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastMousePacketTime + MOUSE_BATCHING_INTERVAL_MS - now));
+                PltSleepMs((int)(lastMousePacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
             }
 
@@ -516,9 +576,9 @@ static void inputSendThreadProc(void* context) {
             uint64_t now = PltGetMillis();
 
             // Delay for batching if required
-            if (now < lastPenPacketTime + PEN_BATCHING_INTERVAL_MS) {
+            if (now < lastPenPacketTime + inputBatchingIntervalMs) {
                 flushInputOnControlStream();
-                PltSleepMs((int)(lastPenPacketTime + PEN_BATCHING_INTERVAL_MS - now));
+                PltSleepMs((int)(lastPenPacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
             }
 

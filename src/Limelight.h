@@ -102,6 +102,20 @@ typedef struct _STREAM_CONFIGURATION {
     // advertises support, so an unpatched host silently leaves it disabled.
     int latencyTraceEnabled;
 
+    // Minimum interval in milliseconds between consecutive mouse motion, gamepad
+    // and pen packets. Events arriving inside the interval are coalesced rather
+    // than dropped, which bounds the packet rate a high polling rate device can
+    // generate.
+    //
+    // 0 leaves the default of 1 ms, which matches a 1000 Hz mouse exactly and so
+    // never makes such a device wait. A negative value disables the wait and
+    // sends strictly on arrival, trading packet rate for immediacy on a LAN.
+    // Positive values are clamped to 1..16 ms.
+    //
+    // Zero deliberately means "unset" rather than "no batching" so that callers
+    // which simply zero this structure keep the stock behaviour.
+    int inputBatchingIntervalMs;
+
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
     // in /launch and /resume requests.
