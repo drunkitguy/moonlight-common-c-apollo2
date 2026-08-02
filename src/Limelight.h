@@ -139,6 +139,13 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // Set to a non-zero value to tell the host that this client wants text input
+    // focus hints (SS_TEXT_FOCUS_PTYPE). This gates the ML_FF_TEXT_FOCUS bit in
+    // the client feature flags, which is what the host uses to decide whether to
+    // run its focus watcher at all. Leaving this at 0 means the host never starts
+    // that work, so this is a real request not a local display preference.
+    int textFocusEnabled;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
@@ -572,6 +579,25 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// Text input focus hint types reported by ConnListenerSetTextFocus().
+#define LI_TEXT_FOCUS_NONE     0 // Focus left a text field, dismiss any keyboard
+#define LI_TEXT_FOCUS_TEXT     1 // A general text field has focus
+#define LI_TEXT_FOCUS_NUMERIC  2 // A field whose expected input is digits has focus
+#define LI_TEXT_FOCUS_PASSWORD 3 // A masked/password field has focus
+
+// This callback is invoked when the host reports that text input focus changed,
+// so the client can raise or dismiss a soft keyboard. It is only invoked if both
+// sides negotiated the capability (STREAM_CONFIGURATION.textFocusEnabled on this
+// side and SS_FF_TEXT_FOCUS on the host side).
+//
+// This is advisory state, not a command. focusType is one of LI_TEXT_FOCUS_*.
+// An unknown focusType must be treated as LI_TEXT_FOCUS_NONE by the client so a
+// future host that adds a type does not leave a keyboard stuck on screen.
+//
+// This callback is invoked on the async callback thread, never on the control
+// stream receive thread, so it may block briefly without stalling the stream.
+typedef void(*ConnListenerSetTextFocus)(uint8_t focusType);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -586,6 +612,7 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    ConnListenerSetTextFocus setTextFocus;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap

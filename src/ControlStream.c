@@ -82,6 +82,9 @@ typedef struct _QUEUED_ASYNC_CALLBACK {
             uint8_t left[DS_EFFECT_PAYLOAD_SIZE];
             uint8_t right[DS_EFFECT_PAYLOAD_SIZE];
         } dsAdaptiveTrigger;
+        struct {
+            uint8_t focusType;
+        } setTextFocus;
     } data;
     LINKED_BLOCKING_QUEUE_ENTRY entry;
 } QUEUED_ASYNC_CALLBACK, *PQUEUED_ASYNC_CALLBACK;
@@ -104,6 +107,14 @@ static bool disconnectPending;
 static bool encryptedControlStream;
 static bool hdrEnabled;
 static SS_HDR_METADATA hdrMetadata;
+
+// Text input focus hint state. Both are written and read only on the control
+// stream receive thread (in queueAsyncCallback), and reset on that thread's
+// behalf in initializeControlStream() before the thread is started, so they
+// need no synchronisation.
+static uint32_t lastTextFocusSequence;
+static bool reportedTextFocusVersionMismatch;
+static bool reportedTextFocusFlagMissing;
 
 static int intervalGoodFrameCount;
 static int intervalTotalFrameCount;
@@ -212,6 +223,7 @@ static PPLT_CRYPTO_CONTEXT decryptionCtx;
 #define IDX_SET_CLIPBOARD 13
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 14
 #define IDX_DS_ADAPTIVE_TRIGGERS 15
+#define IDX_TEXT_FOCUS 16
 
 #define CONTROL_STREAM_TIMEOUT_SEC 10
 #define CONTROL_STREAM_LINGER_TIMEOUT_SEC 2
@@ -233,6 +245,7 @@ static const short packetTypesGen3[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text input focus hint (unused)
 };
 static const short packetTypesGen4[] = {
     0x0606, // Request IDR frame
@@ -251,6 +264,7 @@ static const short packetTypesGen4[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text input focus hint (unused)
 };
 static const short packetTypesGen5[] = {
     0x0305, // Start A
@@ -269,6 +283,7 @@ static const short packetTypesGen5[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text input focus hint (unused)
 };
 static const short packetTypesGen7[] = {
     0x0305, // Start A
@@ -287,6 +302,7 @@ static const short packetTypesGen7[] = {
     -1,     // Set Clipboard (unused)
     -1,     // File transfer nonce request (unused)
     -1,     // Set Adaptive Triggers (unused)
+    -1,     // Text input focus hint (unused)
 };
 static const short packetTypesGen7Enc[] = {
     0x0302, // Request IDR frame
@@ -305,6 +321,7 @@ static const short packetTypesGen7Enc[] = {
     0x3001, // Set Clipboard (Apollo protocol extension)
     0x3002, // File transfer nonce request (Apollo protocol extension)
     0x5503, // Set Adaptive Triggers (Sunshine protocol extension)
+    0x3020, // Text input focus hint (Apollo protocol extension)
 };
 
 static const char requestIdrFrameGen3[] = { 0, 0 };
@@ -451,6 +468,9 @@ int initializeControlStream(void) {
 
     lastGoodFrame = 0;
     lastSeenFrame = 0;
+    lastTextFocusSequence = 0;
+    reportedTextFocusVersionMismatch = false;
+    reportedTextFocusFlagMissing = false;
     disconnectPending = false;
     intervalGoodFrameCount = 0;
     intervalTotalFrameCount = 0;
@@ -1100,6 +1120,22 @@ static void asyncCallbackThreadFunc(void* context) {
                                                   queuedCb->data.dsAdaptiveTrigger.left,
                                                   queuedCb->data.dsAdaptiveTrigger.right);
             break;
+        case IDX_TEXT_FOCUS:
+            // Focus is a state, not an event, so only the newest one matters. Collapse
+            // any hints queued behind this one and deliver only the final state. This
+            // is the coalescing half of the debounce; the client does the timing half.
+            while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS &&
+                   nextCb->typeIndex == queuedCb->typeIndex) {
+                if (LbqPollQueueElement(&asyncCallbackQueue, (void**)&nextCb) != LBQ_SUCCESS) {
+                    break;
+                }
+
+                free(queuedCb);
+                queuedCb = nextCb;
+            }
+
+            ListenerCallbacks.setTextFocus(queuedCb->data.setTextFocus.focusType);
+            break;
         default:
             // Unhandled packet type from queueAsyncCallback()
             LC_ASSERT(false);
@@ -1118,7 +1154,8 @@ static bool needsAsyncCallback(unsigned short packetType) {
            packetType == packetTypes[IDX_HDR_INFO] ||
            packetType == packetTypes[IDX_SET_CLIPBOARD] ||
            packetType == packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST] ||
-           packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS];
+           packetType == packetTypes[IDX_DS_ADAPTIVE_TRIGGERS] ||
+           packetType == packetTypes[IDX_TEXT_FOCUS];
 }
 
 static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
@@ -1178,6 +1215,78 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.left, DS_EFFECT_PAYLOAD_SIZE);
         BbGetBytes(&bb, queuedCb->data.dsAdaptiveTrigger.right, DS_EFFECT_PAYLOAD_SIZE);
         queuedCb->typeIndex = IDX_DS_ADAPTIVE_TRIGGERS;
+    }
+    else if (ctlHdr->type == packetTypes[IDX_TEXT_FOCUS]) {
+        uint8_t version;
+        uint8_t focusType;
+        uint16_t reserved;
+        uint32_t sequenceNumber;
+
+        // We only ever act on hints we asked for. A host that ignores our feature
+        // flag must not be able to raise a keyboard on a client that did not opt in.
+        if (!StreamConfig.textFocusEnabled) {
+            free(queuedCb);
+            return;
+        }
+
+        // The contract has both sides advertise, so a hint from a host that never
+        // claimed the capability means its SDP attribute is wrong. Say which half
+        // is broken rather than letting the feature die quietly.
+        if (!(SunshineFeatureFlags & SS_FF_TEXT_FOCUS)) {
+            if (!reportedTextFocusFlagMissing) {
+                reportedTextFocusFlagMissing = true;
+                Limelog("Host sent a text focus hint without advertising SS_FF_TEXT_FOCUS "
+                        "(x-ss-general.featureFlags = 0x%x). Ignoring focus hints.\n",
+                        SunshineFeatureFlags);
+            }
+            free(queuedCb);
+            return;
+        }
+
+        // Fixed size payload. Anything else is a peer that disagrees about the
+        // format, and guessing at a partial parse is how a keyboard gets stuck on.
+        if (packetLength - (int)sizeof(*ctlHdr) != SS_TEXT_FOCUS_PAYLOAD_SIZE) {
+            Limelog("Text focus hint has unexpected length %d (expected %d), ignoring\n",
+                    packetLength - (int)sizeof(*ctlHdr), SS_TEXT_FOCUS_PAYLOAD_SIZE);
+            free(queuedCb);
+            return;
+        }
+
+        BbGet8(&bb, &version);
+        BbGet8(&bb, &focusType);
+        BbGet16(&bb, &reserved);
+        BbGet32(&bb, &sequenceNumber);
+
+        if (version != SS_TEXT_FOCUS_VERSION) {
+            // Log once rather than per hint, since a mismatched host would spam this.
+            if (!reportedTextFocusVersionMismatch) {
+                reportedTextFocusVersionMismatch = true;
+                Limelog("Host sent text focus hint version %u, we understand %u. "
+                        "Ignoring focus hints for this session.\n",
+                        version, SS_TEXT_FOCUS_VERSION);
+            }
+            free(queuedCb);
+            return;
+        }
+
+        // The control channel is reliable and ordered, so this should not trigger.
+        // It is here because a stale hint is worse than a missing one: it can leave
+        // the keyboard up after focus already left the field.
+        if (lastTextFocusSequence != 0 && sequenceNumber <= lastTextFocusSequence) {
+            free(queuedCb);
+            return;
+        }
+        lastTextFocusSequence = sequenceNumber;
+
+        // An unknown type from a newer host is treated as "no focus" rather than
+        // dropped, so a field type we do not understand dismisses the keyboard
+        // instead of leaving whatever was up before it stuck on screen.
+        if (focusType > LI_TEXT_FOCUS_PASSWORD) {
+            focusType = LI_TEXT_FOCUS_NONE;
+        }
+
+        queuedCb->data.setTextFocus.focusType = focusType;
+        queuedCb->typeIndex = IDX_TEXT_FOCUS;
     }
     else {
         // Unhandled packet type from needsAsyncCallback()

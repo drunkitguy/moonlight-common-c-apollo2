@@ -95,18 +95,26 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 #define ML_FF_LATENCY_TRACE 0x04 // Client understands SS_FRAME_TIMESTAMP_EXT and the clock sync messages
+#define ML_FF_TEXT_FOCUS 0x08 // Client wants SS_TEXT_FOCUS_PTYPE hints and will raise a keyboard
 
 // Host feature flags in x-ss-general.featureFlags. These must match the host's
 // platform_caps constants (Apollo: src/platform/common.h).
 #define SS_FF_PEN_TOUCH_EVENTS 0x01
 #define SS_FF_CONTROLLER_TOUCH_EVENTS 0x02
 #define SS_FF_LATENCY_TRACE 0x04 // Host emits SS_FRAME_TIMESTAMP_EXT and answers clock sync
+#define SS_FF_TEXT_FOCUS 0x08 // Host detects text input focus and emits SS_TEXT_FOCUS_PTYPE
 
 // True only when BOTH peers advertised the latency trace capability and the
 // client enabled it in STREAM_CONFIGURATION. Read on the video receive thread
 // and the control threads; written once during connection setup before any of
 // those threads start, so it needs no synchronisation after startup.
 extern bool LatencyTraceEnabled;
+
+// Apollo protocol extension: host -> client text input focus hint.
+// 8 byte fixed payload, little endian. See section 7 of the wire contract.
+#define SS_TEXT_FOCUS_PTYPE 0x3020
+#define SS_TEXT_FOCUS_VERSION 1
+#define SS_TEXT_FOCUS_PAYLOAD_SIZE 8
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 

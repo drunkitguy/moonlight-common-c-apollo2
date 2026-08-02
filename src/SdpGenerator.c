@@ -277,6 +277,13 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             moonlightFeatureFlags |= ML_FF_LATENCY_TRACE;
         }
 
+        // Only ask for text focus hints if the client actually wants them. The host
+        // has to watch its own UI focus to produce these, which is not free, so an
+        // unset flag has to mean "do not start that work" rather than "send anyway".
+        if (StreamConfig.textFocusEnabled) {
+            moonlightFeatureFlags |= ML_FF_TEXT_FOCUS;
+        }
+
         snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 
