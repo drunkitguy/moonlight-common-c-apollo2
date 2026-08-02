@@ -269,6 +269,14 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
     if (IS_SUNSHINE()) {
         // Send client feature flags to Sunshine hosts
         uint32_t moonlightFeatureFlags = ML_FF_FEC_STATUS | ML_FF_SESSION_ID_V1;
+
+        // Only ask for text focus hints if the client actually wants them. The host
+        // has to watch its own UI focus to produce these, which is not free, so an
+        // unset flag has to mean "do not start that work" rather than "send anyway".
+        if (StreamConfig.textFocusEnabled) {
+            moonlightFeatureFlags |= ML_FF_TEXT_FOCUS;
+        }
+
         snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 

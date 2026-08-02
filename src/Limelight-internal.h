@@ -88,6 +88,20 @@ extern uint32_t EncryptionFeaturesEnabled;
 // Client feature flags for x-ml-general.featureFlags SDP attribute
 #define ML_FF_FEC_STATUS 0x01 // Client sends SS_FRAME_FEC_STATUS for frame losses
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
+// 0x04 is ML_FF_LATENCY_TRACE on the instrumentation branch. Do not reuse it here.
+#define ML_FF_TEXT_FOCUS 0x08 // Client wants SS_TEXT_FOCUS_PTYPE hints and will raise a keyboard
+
+// Host feature flags in x-ss-general.featureFlags. These must match the host's
+// definitions exactly; see artifacts/wire-contract-frame-trace.md section 7.
+// 0x01 and 0x02 are LI_FF_PEN_TOUCH_EVENTS / LI_FF_CONTROLLER_TOUCH_EVENTS.
+// 0x04 is SS_FF_LATENCY_TRACE on the instrumentation branch. Do not reuse it here.
+#define SS_FF_TEXT_FOCUS 0x08 // Host detects text input focus and emits SS_TEXT_FOCUS_PTYPE
+
+// Apollo protocol extension: host -> client text input focus hint.
+// 8 byte fixed payload, little endian. See the wire contract for the layout.
+#define SS_TEXT_FOCUS_PTYPE 0x3020
+#define SS_TEXT_FOCUS_VERSION 1
+#define SS_TEXT_FOCUS_PAYLOAD_SIZE 8
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
