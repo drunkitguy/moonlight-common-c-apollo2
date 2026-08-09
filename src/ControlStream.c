@@ -182,6 +182,105 @@ static bool clockSyncOffsetValid;
 static uint64_t clockSyncLastRequestTimeMs;
 
 bool LatencyTraceEnabled;
+bool InputProbeEnabled;
+
+// --- Input round-trip probe records (SPEC.md §4 Item B) -------------------
+//
+// A bounded ring of probes we have sent, so an echo can be matched back to the
+// event that produced it and so a probe whose echo never arrives still produces
+// a row with an empty host half rather than disappearing.
+//
+// Thread ownership: written on the input send thread (recordInputProbeSent),
+// completed on the control receive thread (the echo handler), and drained on
+// whichever thread ends the session. All three go through inputProbeMutex,
+// which is held only for the arithmetic and the array write -- never across a
+// send, a callback or any I/O.
+#define INPUT_PROBE_RING_SIZE 256
+
+typedef struct _INPUT_PROBE_RECORD {
+    uint32_t sequenceNumber;
+    uint64_t clientEventTimeUs;
+    uint64_t clientSendTimeUs;
+    uint64_t clientEchoRxUs;   // 0 until the echo arrives
+    uint64_t hostRecvTimeUs;   // client epoch, 0 if unconverted
+    uint64_t hostInjectTimeUs; // client epoch, 0 if unconverted or unavailable
+    bool batchDelayed;
+    bool hostNoInput;
+    bool complete;
+} INPUT_PROBE_RECORD, *PINPUT_PROBE_RECORD;
+
+static PLT_MUTEX inputProbeMutex;
+static INPUT_PROBE_RECORD inputProbeRing[INPUT_PROBE_RING_SIZE];
+static int inputProbeRingPos;
+static uint32_t inputProbeEchoesMatched;
+static uint32_t inputProbeEchoesUnmatched;
+static uint32_t inputProbeConversionFailures;
+
+void recordInputProbeSent(uint32_t sequenceNumber, uint64_t clientEventTimeUs,
+                          uint64_t clientSendTimeUs, bool batchDelayed) {
+    PINPUT_PROBE_RECORD rec;
+
+    PltLockMutex(&inputProbeMutex);
+    rec = &inputProbeRing[inputProbeRingPos];
+    inputProbeRingPos = (inputProbeRingPos + 1) % INPUT_PROBE_RING_SIZE;
+
+    memset(rec, 0, sizeof(*rec));
+    rec->sequenceNumber = sequenceNumber;
+    rec->clientEventTimeUs = clientEventTimeUs;
+    rec->clientSendTimeUs = clientSendTimeUs;
+    rec->batchDelayed = batchDelayed;
+    PltUnlockMutex(&inputProbeMutex);
+}
+
+// Folds an echo into the matching record. Control receive thread.
+static void handleInputProbeEcho(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength);
+
+static void completeInputProbe(uint32_t sequenceNumber, uint64_t hostRecvUs,
+                               uint64_t hostInjectUs, bool hostNoInput) {
+    uint64_t nowUs = PltGetMicros();
+    uint64_t convertedRecv = 0;
+    uint64_t convertedInject = 0;
+    bool converted;
+    int i;
+
+    // Conversion uses the existing clock offset estimate -- deliberately not a
+    // second sync mechanism. A sample we cannot convert keeps its client half
+    // and leaves the host columns empty rather than emitting a garbage number.
+    converted = convertHostToClientMicros(hostRecvUs, &convertedRecv);
+    if (converted && hostInjectUs != 0) {
+        if (!convertHostToClientMicros(hostInjectUs, &convertedInject)) {
+            convertedInject = 0;
+        }
+    }
+
+    PltLockMutex(&inputProbeMutex);
+    if (!converted) {
+        inputProbeConversionFailures++;
+    }
+
+    for (i = 0; i < INPUT_PROBE_RING_SIZE; i++) {
+        PINPUT_PROBE_RECORD rec = &inputProbeRing[i];
+        if (rec->sequenceNumber != sequenceNumber || rec->clientSendTimeUs == 0) {
+            continue;
+        }
+        if (rec->complete) {
+            // A duplicated echo must not be folded in twice.
+            break;
+        }
+        rec->clientEchoRxUs = nowUs;
+        rec->hostRecvTimeUs = converted ? convertedRecv : 0;
+        rec->hostInjectTimeUs = convertedInject;
+        rec->hostNoInput = hostNoInput;
+        rec->complete = true;
+        inputProbeEchoesMatched++;
+        PltUnlockMutex(&inputProbeMutex);
+        return;
+    }
+
+    // Either the ring wrapped past it or the host invented a sequence number.
+    inputProbeEchoesUnmatched++;
+    PltUnlockMutex(&inputProbeMutex);
+}
 
 static LINKED_BLOCKING_QUEUE invalidReferenceFrameTuples;
 static LINKED_BLOCKING_QUEUE frameFecStatusQueue;
@@ -397,6 +496,12 @@ int initializeControlStream(void) {
     LbqInitializeLinkedBlockingQueue(&asyncCallbackQueue, 30);
     PltCreateMutex(&enetMutex);
     PltCreateMutex(&clockSyncMutex);
+    PltCreateMutex(&inputProbeMutex);
+    memset(inputProbeRing, 0, sizeof(inputProbeRing));
+    inputProbeRingPos = 0;
+    inputProbeEchoesMatched = 0;
+    inputProbeEchoesUnmatched = 0;
+    inputProbeConversionFailures = 0;
 
     // Reset clock sync state for this connection. These are file-scope statics
     // and moonlight-common-c supports reconnecting in the same process, so they
@@ -494,6 +599,7 @@ void destroyControlStream(void) {
 
     PltDeleteMutex(&enetMutex);
     PltDeleteMutex(&clockSyncMutex);
+    PltDeleteMutex(&inputProbeMutex);
 }
 
 static void queueFrameInvalidationTuple(uint32_t startFrame, uint32_t endFrame) {
@@ -1626,6 +1732,12 @@ static void controlReceiveThreadFunc(void* context) {
                 continue;
             }
 
+            if (InputProbeEnabled && ctlHdr->type == (unsigned short)SS_INPUT_PROBE_ECHO_PTYPE) {
+                handleInputProbeEcho(ctlHdr, packetLength);
+                free(ctlHdr);
+                continue;
+            }
+
             // Process client callbacks in a separate thread
             if (needsAsyncCallback(ctlHdr->type)) {
                 queueAsyncCallback(ctlHdr, packetLength);
@@ -2024,6 +2136,85 @@ int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t chan
     }
 
     return 0;
+}
+
+int LiDrainInputProbes(PLI_INPUT_PROBE_SAMPLE samples, int maxSamples) {
+    int written = 0;
+    int i;
+
+    if (samples == NULL || maxSamples <= 0) {
+        return 0;
+    }
+
+    PltLockMutex(&inputProbeMutex);
+    for (i = 0; i < INPUT_PROBE_RING_SIZE && written < maxSamples; i++) {
+        PINPUT_PROBE_RECORD rec = &inputProbeRing[i];
+        if (rec->clientSendTimeUs == 0) {
+            continue;
+        }
+        samples[written].sequenceNumber = rec->sequenceNumber;
+        samples[written].clientEventTimeUs = rec->clientEventTimeUs;
+        samples[written].clientSendTimeUs = rec->clientSendTimeUs;
+        samples[written].clientEchoRxUs = rec->clientEchoRxUs;
+        samples[written].hostRecvTimeUs = rec->hostRecvTimeUs;
+        samples[written].hostInjectTimeUs = rec->hostInjectTimeUs;
+        samples[written].batchDelayed = rec->batchDelayed ? 1 : 0;
+        samples[written].hostNoInput = rec->hostNoInput ? 1 : 0;
+        samples[written].complete = rec->complete ? 1 : 0;
+        written++;
+    }
+    PltUnlockMutex(&inputProbeMutex);
+
+    return written;
+}
+
+void LiGetInputProbeStats(uint32_t* sent, uint32_t* rateLimited,
+                          uint32_t* echoesMatched, uint32_t* conversionFailures) {
+    PltLockMutex(&inputProbeMutex);
+    if (echoesMatched != NULL) {
+        *echoesMatched = inputProbeEchoesMatched;
+    }
+    if (conversionFailures != NULL) {
+        *conversionFailures = inputProbeConversionFailures;
+    }
+    PltUnlockMutex(&inputProbeMutex);
+
+    // These two live on the input send thread's side of the fence and are only
+    // ever incremented there, so a torn read is not possible on any platform we
+    // support and a slightly stale count is harmless in metadata.
+    getInputProbeSendCounters(sent, rateLimited);
+}
+
+// Parses an echo off the wire. Control receive thread.
+static void handleInputProbeEcho(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLength) {
+    SS_INPUT_PROBE_ECHO echo;
+
+    // Fixed size. A different length means a peer that disagrees about the
+    // format, and guessing at a partial parse would produce a plausible-looking
+    // latency number that is wrong, which is worse than no number.
+    if (packetLength - (int)sizeof(*ctlHdr) != (int)sizeof(echo)) {
+        return;
+    }
+
+    memcpy(&echo, ((char*)ctlHdr) + sizeof(*ctlHdr), sizeof(echo));
+
+    if (echo.version != SS_INPUT_PROBE_VERSION) {
+        return;
+    }
+
+    completeInputProbe(LE32(echo.sequenceNumber),
+                       LE64(echo.hostRecvTimeUs),
+                       LE64(echo.hostInjectTimeUs),
+                       (echo.flags & SS_INPUT_PROBE_ECHO_FLAG_NO_INPUT) != 0);
+}
+
+void sendInputProbeOnControlStream(const void* probe, int length, uint8_t channelId) {
+    LC_ASSERT(AppVersionQuad[0] >= 5);
+
+    // moreData false so the probe is flushed rather than waiting for the next
+    // input packet. A probe that sits in a coalescing buffer measures the buffer
+    // instead of the link, which would quietly invalidate the whole measurement.
+    sendMessageAndForget(SS_INPUT_PROBE_PTYPE, (short)length, probe, channelId, 0, false);
 }
 
 // Called by the input stream to flush queued packets before a batching wait

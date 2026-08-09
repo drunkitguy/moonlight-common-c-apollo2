@@ -277,6 +277,13 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
             moonlightFeatureFlags |= ML_FF_LATENCY_TRACE;
         }
 
+        // Only ask for input echoes when the client wants them. The host has to
+        // stamp its injection path to answer, which is work it should not do for
+        // a client that will throw the answer away.
+        if (StreamConfig.inputProbeEnabled) {
+            moonlightFeatureFlags |= ML_FF_INPUT_PROBE;
+        }
+
         snprintf(payloadStr, sizeof(payloadStr), "%u", moonlightFeatureFlags);
         err |= addAttributeString(&optionHead, "x-ml-general.featureFlags", payloadStr);
 

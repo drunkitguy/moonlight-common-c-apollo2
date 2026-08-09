@@ -178,4 +178,46 @@ typedef struct _SS_CLOCK_SYNC_RESPONSE {
     uint64_t hostTxUs;    // t3, host CLOCK_MONOTONIC
 } SS_CLOCK_SYNC_RESPONSE, *PSS_CLOCK_SYNC_RESPONSE;
 
+// Apollo 2.0 input round-trip probe, SPEC.md §4 Item B. See section 8 of
+// artifacts/wire-contract-frame-trace.md.
+//
+// The probe is sent immediately BEFORE a marked input packet on the same
+// reliable ordered channel, and the host associates it with the next input
+// packet it processes. Doing it this way means the input packet itself is
+// untouched, so a stock host sees exactly the bytes it sees today and this
+// cannot regress the input path for anyone.
+#define SS_INPUT_PROBE_PTYPE      0x3030
+#define SS_INPUT_PROBE_ECHO_PTYPE 0x3031
+
+#define SS_INPUT_PROBE_VERSION 1
+
+// flags on the probe
+#define SS_INPUT_PROBE_FLAG_BATCH_DELAYED 0x01 // batching limiter slept before this send
+
+// flags on the echo
+#define SS_INPUT_PROBE_ECHO_FLAG_NO_INPUT 0x01 // host associated no input packet with it
+
+typedef struct _SS_INPUT_PROBE {
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t sequenceNumber;
+    uint64_t clientEventTimeUs; // kernel event time, client CLOCK_MONOTONIC
+    uint64_t clientSendTimeUs;  // immediately before enqueue, client CLOCK_MONOTONIC
+} SS_INPUT_PROBE, *PSS_INPUT_PROBE;
+
+typedef struct _SS_INPUT_PROBE_ECHO {
+    uint8_t  version;
+    uint8_t  flags;
+    uint16_t reserved;
+    uint32_t sequenceNumber;    // echoed verbatim
+    uint64_t hostRecvTimeUs;    // host CLOCK_MONOTONIC
+    uint64_t hostInjectTimeUs;  // host CLOCK_MONOTONIC, after OS injection
+} SS_INPUT_PROBE_ECHO, *PSS_INPUT_PROBE_ECHO;
+
+// Both directions are fixed size and the peers must agree exactly, so enforce it
+// at compile time rather than trusting the wire contract document to stay true.
+typedef char SS_INPUT_PROBE_size_check[(sizeof(SS_INPUT_PROBE) == 24) ? 1 : -1];
+typedef char SS_INPUT_PROBE_ECHO_size_check[(sizeof(SS_INPUT_PROBE_ECHO) == 24) ? 1 : -1];
+
 #pragma pack(pop)

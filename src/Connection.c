@@ -457,6 +457,20 @@ int LiStartConnection(PSERVER_INFORMATION serverInfo, PSTREAM_CONFIGURATION stre
         Limelog("Latency trace negotiated with host\n");
     }
 
+    // Same three-way requirement for the input probe, and the same reason for
+    // resolving it here rather than lazily: the input send thread and the
+    // control receive thread both read it without a lock.
+    InputProbeEnabled = StreamConfig.inputProbeEnabled != 0 &&
+                        IS_SUNSHINE() &&
+                        (SunshineFeatureFlags & SS_FF_INPUT_PROBE) != 0;
+    if (StreamConfig.inputProbeEnabled && !InputProbeEnabled) {
+        Limelog("Input probe requested but not supported by host (flags 0x%x); continuing without it\n",
+                SunshineFeatureFlags);
+    }
+    else if (InputProbeEnabled) {
+        Limelog("Input round-trip probe negotiated with host\n");
+    }
+
     Limelog("Initializing control stream...");
     ListenerCallbacks.stageStarting(STAGE_CONTROL_STREAM_INIT);
     err = initializeControlStream();
