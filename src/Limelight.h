@@ -133,6 +133,12 @@ typedef struct _STREAM_CONFIGURATION {
     // it suppresses is also the pipeline's backlog-drain mechanism. Values above
     // 50 are clamped.
     int adaptiveLateFrameToleranceMaxMs;
+    // See LiSetNextInputEventTime() and LiDrainInputProbes().
+    // Set to a non-zero value to measure input round trip: the client stamps a
+    // probe alongside sampled input events and the host echoes back when it
+    // received and injected them. Gated on the host advertising support, and
+    // rate limited by the client so the cost does not scale with input rate.
+    int inputProbeEnabled;
 
     // AES encryption data for the remote input stream. This must be
     // the same as what was passed as rikey and rikeyid
@@ -719,6 +725,42 @@ int LiSendExecServerCmd(uint8_t cmdId);
 int LiSendEmptyPayload();
 
 // This function queues a relative mouse move event to be sent to the remote server.
+// Publishes the kernel timestamp of the input event that the caller is about to
+// submit, in the client's monotonic microsecond epoch. Call immediately before
+// the corresponding LiSend*Event() call, on the same thread.
+//
+// This is purely diagnostic. The value never enters the input packet, so it
+// cannot affect what the host receives or when. It is ignored entirely unless
+// the input probe was negotiated with the host, and in that case it returns
+// after a single branch, so the input hot path is unchanged when disabled.
+void LiSetNextInputEventTime(uint64_t clientEventTimeUs);
+
+// One completed or pending input probe. All times are in the client's monotonic
+// microsecond epoch; host times have already been converted using the clock
+// offset estimate. A zero means "not recorded", which the caller must render as
+// blank rather than as a zero duration.
+typedef struct _LI_INPUT_PROBE_SAMPLE {
+    uint32_t sequenceNumber;
+    uint64_t clientEventTimeUs;
+    uint64_t clientSendTimeUs;
+    uint64_t clientEchoRxUs;
+    uint64_t hostRecvTimeUs;
+    uint64_t hostInjectTimeUs;
+    uint8_t batchDelayed;
+    uint8_t hostNoInput;
+    uint8_t complete;
+} LI_INPUT_PROBE_SAMPLE, *PLI_INPUT_PROBE_SAMPLE;
+
+// Copies up to maxSamples probe records out of the ring and returns how many
+// were written. Safe to call while streaming, but intended for session end.
+int LiDrainInputProbes(PLI_INPUT_PROBE_SAMPLE samples, int maxSamples);
+
+// Probe counters for the trace metadata: how many were sent, how many were
+// suppressed by the rate limiter, how many echoes matched, and how many could
+// not be converted to the client clock.
+void LiGetInputProbeStats(uint32_t* sent, uint32_t* rateLimited,
+                          uint32_t* echoesMatched, uint32_t* conversionFailures);
+
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
 
 // This function queues a mouse position update event to be sent to the remote server.

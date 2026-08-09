@@ -108,6 +108,11 @@ typedef struct _PACKET_HOLDER {
     uint32_t enetPacketFlags;
     uint8_t channelId;
 
+    // Kernel event time for this input, in the client's monotonic epoch, or 0
+    // when unknown or when the probe is disabled. Carried alongside the packet
+    // rather than in it, so the bytes on the wire are unchanged.
+    uint64_t probeEventTimeUs;
+
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
     // sent to the host.
@@ -261,7 +266,69 @@ static void freePacketHolder(PPACKET_HOLDER holder) {
     }
 }
 
+// --- Input round-trip probe (SPEC.md §4 Item B) ---------------------------
+//
+// Kernel event time for the input event currently being submitted, published by
+// LiSetNextInputEventTime() immediately before the caller invokes one of the
+// LiSend*Event() functions, and consumed by the next packet holder allocated.
+//
+// Thread ownership: written and consumed on whichever thread submits input. In
+// this client that is a single thread. If a future caller submits input from
+// two threads at once the worst case is that one sampled probe is attributed to
+// the wrong event, which spoils one diagnostic row; it cannot corrupt or reorder
+// input, because the value never travels in the input packet. That trade is why
+// this is a plain global rather than a lock on the input hot path.
+static uint64_t pendingProbeEventTimeUs;
+
+// Rate ceiling, so probe cost does not scale with input rate. A controller
+// reports at roughly 100 Hz and a gaming mouse at up to 1000 Hz; without a
+// ceiling the latter would add 1000 packets per second in each direction to the
+// channel that also carries input. 20 per second is far more than enough to
+// characterise a latency distribution and is negligible either way.
+#define INPUT_PROBE_MAX_PER_SECOND 20
+#define INPUT_PROBE_MIN_INTERVAL_MS (1000 / INPUT_PROBE_MAX_PER_SECOND)
+
+static uint64_t lastInputProbeTimeMs;
+static uint32_t inputProbeNextSequenceNumber;
+static uint32_t inputProbesSent;
+static uint32_t inputProbesSuppressedByRateLimit;
+
+void LiSetNextInputEventTime(uint64_t clientEventTimeUs) {
+    // Zero cost when the probe is off: one predictable branch and a return, no
+    // store. This is the input hot path and the whole feature exists to measure
+    // it, so it must not perturb it.
+    if (!InputProbeEnabled) {
+        return;
+    }
+    pendingProbeEventTimeUs = clientEventTimeUs;
+}
+
+void getInputProbeSendCounters(uint32_t* sent, uint32_t* rateLimited) {
+    if (sent != NULL) {
+        *sent = inputProbesSent;
+    }
+    if (rateLimited != NULL) {
+        *rateLimited = inputProbesSuppressedByRateLimit;
+    }
+}
+
+static PPACKET_HOLDER allocatePacketHolderRaw(int extraLength);
+
+// Wraps allocation so the pending kernel event time is attached to exactly one
+// packet holder and then cleared, without having to touch each of the fifteen
+// call sites that enqueue input.
 static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
+    PPACKET_HOLDER holder = allocatePacketHolderRaw(extraLength);
+    if (holder != NULL) {
+        holder->probeEventTimeUs = pendingProbeEventTimeUs;
+    }
+    // Cleared unconditionally: a stamp must never carry over to a later,
+    // unrelated packet if allocation failed or the caller never sent.
+    pendingProbeEventTimeUs = 0;
+    return holder;
+}
+
+static PPACKET_HOLDER allocatePacketHolderRaw(int extraLength) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -290,6 +357,49 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
         // Otherwise we'll have to allocate
         return malloc(sizeof(*holder));
     }
+}
+
+// Emits a probe for the input packet that is about to be sent.
+//
+// Sent immediately BEFORE the input packet, as the wire contract specifies: the
+// host associates a probe with the next input packet it processes, and the
+// channel is reliable and ordered so that association is deterministic.
+//
+// The batching flag is already correct here even though the send has not
+// happened yet, because the limiter's sleep occurs earlier in the same loop
+// iteration. That ordering is what lets the probe both precede the input packet
+// and still report whether the limiter engaged.
+static void sendInputProbeIfDue(PPACKET_HOLDER holder, bool batchDelayed) {
+    SS_INPUT_PROBE probe;
+    uint64_t nowMs;
+
+    if (!InputProbeEnabled || holder->probeEventTimeUs == 0) {
+        return;
+    }
+
+    nowMs = PltGetMillis();
+    if (lastInputProbeTimeMs != 0 && nowMs - lastInputProbeTimeMs < INPUT_PROBE_MIN_INTERVAL_MS) {
+        inputProbesSuppressedByRateLimit++;
+        return;
+    }
+    lastInputProbeTimeMs = nowMs;
+
+    memset(&probe, 0, sizeof(probe));
+    probe.version = SS_INPUT_PROBE_VERSION;
+    probe.flags = batchDelayed ? SS_INPUT_PROBE_FLAG_BATCH_DELAYED : 0;
+    probe.sequenceNumber = LE32(++inputProbeNextSequenceNumber);
+    probe.clientEventTimeUs = LE64(holder->probeEventTimeUs);
+    probe.clientSendTimeUs = LE64(PltGetMicros());
+
+    // Recorded before the send so a probe that is dropped in flight still shows
+    // up as a client-side row with an empty host half, rather than vanishing.
+    recordInputProbeSent(inputProbeNextSequenceNumber,
+                         holder->probeEventTimeUs,
+                         LE64(probe.clientSendTimeUs),
+                         batchDelayed);
+
+    sendInputProbeOnControlStream(&probe, sizeof(probe), holder->channelId);
+    inputProbesSent++;
 }
 
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
@@ -405,6 +515,12 @@ static void inputSendThreadProc(void* context) {
             return;
         }
 
+        // Whether the batching limiter actually slept before this packet went
+        // out. Reported on the probe so "does the limiter bind for a Bluetooth
+        // controller" is answered by measurement rather than by the argument
+        // that it should not.
+        bool batchDelayed = false;
+
         // If it's a multi-controller packet we can do batching
         if (holder->packet.header.magic == multiControllerMagicLE) {
             PPACKET_HOLDER controllerBatchHolder;
@@ -416,6 +532,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastControllerPacketTime[controllerNumber] + inputBatchingIntervalMs) {
+                batchDelayed = true;
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastControllerPacketTime[controllerNumber] + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
@@ -474,6 +591,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastMousePacketTime + inputBatchingIntervalMs) {
+                batchDelayed = true;
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastMousePacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
@@ -519,6 +637,7 @@ static void inputSendThreadProc(void* context) {
                 PltUnlockMutex(&batchedInputMutex);
 
                 // Encrypt and send the split packet
+                sendInputProbeIfDue(holder, batchDelayed);
                 if (!sendInputPacket(holder, more)) {
                     freePacketHolder(holder);
                     return;
@@ -545,6 +664,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastMousePacketTime + inputBatchingIntervalMs) {
+                batchDelayed = true;
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastMousePacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
@@ -577,6 +697,7 @@ static void inputSendThreadProc(void* context) {
 
             // Delay for batching if required
             if (now < lastPenPacketTime + inputBatchingIntervalMs) {
+                batchDelayed = true;
                 flushInputOnControlStream();
                 PltSleepMs((int)(lastPenPacketTime + inputBatchingIntervalMs - now));
                 now = PltGetMillis();
@@ -712,6 +833,7 @@ static void inputSendThreadProc(void* context) {
         }
 
         // Encrypt and send the input packet
+        sendInputProbeIfDue(holder, batchDelayed);
         if (!sendInputPacket(holder, LbqGetItemCount(&packetQueue) > 0)) {
             freePacketHolder(holder);
             return;

@@ -96,6 +96,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define ML_FF_SESSION_ID_V1 0x02 // Client supports X-SS-Ping-Payload and X-SS-Connect-Data
 #define ML_FF_LATENCY_TRACE 0x04 // Client understands SS_FRAME_TIMESTAMP_EXT and the clock sync messages
 #define ML_FF_TEXT_FOCUS 0x08 // Client wants SS_TEXT_FOCUS_PTYPE hints and will raise a keyboard
+#define ML_FF_INPUT_PROBE 0x10 // Client sends SS_INPUT_PROBE and wants echoes
 
 // Host feature flags in x-ss-general.featureFlags. These must match the host's
 // platform_caps constants (Apollo: src/platform/common.h).
@@ -103,6 +104,7 @@ extern uint32_t EncryptionFeaturesEnabled;
 #define SS_FF_CONTROLLER_TOUCH_EVENTS 0x02
 #define SS_FF_LATENCY_TRACE 0x04 // Host emits SS_FRAME_TIMESTAMP_EXT and answers clock sync
 #define SS_FF_TEXT_FOCUS 0x08 // Host detects text input focus and emits SS_TEXT_FOCUS_PTYPE
+#define SS_FF_INPUT_PROBE 0x10 // Host echoes SS_INPUT_PROBE with receive and inject times
 
 // True only when BOTH peers advertised the latency trace capability and the
 // client enabled it in STREAM_CONFIGURATION. Read on the video receive thread
@@ -115,6 +117,11 @@ extern bool LatencyTraceEnabled;
 #define SS_TEXT_FOCUS_PTYPE 0x3020
 #define SS_TEXT_FOCUS_VERSION 1
 #define SS_TEXT_FOCUS_PAYLOAD_SIZE 8
+// True only when BOTH peers advertised the input probe capability and the client
+// enabled it. Read on the input send thread and the control receive thread;
+// written once during connection setup before either starts, so it needs no
+// synchronisation afterwards.
+extern bool InputProbeEnabled;
 
 #define UDP_RECV_POLL_TIMEOUT_MS 100
 
@@ -151,6 +158,18 @@ void connectionReceivedCompleteFrame(uint32_t frameIndex);
 void connectionSawFrame(uint32_t frameIndex);
 void connectionSendFrameFecStatus(PSS_FRAME_FEC_STATUS fecStatus);
 int sendInputPacketOnControlStream(unsigned char* data, int length, uint8_t channelId, uint32_t flags, bool moreData);
+
+// Sends an input round-trip probe. Separate from the input packet path so the
+// input packet's bytes and framing are completely unchanged.
+void sendInputProbeOnControlStream(const void* probe, int length, uint8_t channelId);
+
+// Probe send counters, owned by the input send thread.
+void getInputProbeSendCounters(uint32_t* sent, uint32_t* rateLimited);
+
+// Records a probe the client has just sent, so a row exists even if the echo
+// never arrives. Called on the input send thread.
+void recordInputProbeSent(uint32_t sequenceNumber, uint64_t clientEventTimeUs,
+                          uint64_t clientSendTimeUs, bool batchDelayed);
 void flushInputOnControlStream(void);
 bool isControlDataInTransit(void);
 
