@@ -479,6 +479,27 @@ typedef void(*ConnListenerSetAdaptiveTriggers)(uint16_t controllerNumber, uint8_
 // This callback is invoked to set a controller's RGB LED (if present).
 typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r, uint8_t g, uint8_t b);
 
+// Text field focus kinds reported by ConnListenerSetTextFieldFocus() (Apollo protocol extension).
+#define ML_TEXT_FIELD_NONE     0 // No text field is focused on the host
+#define ML_TEXT_FIELD_TEXT     1 // A general text field is focused
+#define ML_TEXT_FIELD_NUMERIC  2 // A numeric-only field is focused
+#define ML_TEXT_FIELD_PASSWORD 3 // A password field is focused
+
+// Text field focus flags reported by ConnListenerSetTextFieldFocus() (Apollo protocol extension).
+#define ML_TEXT_FIELD_FLAG_READ_ONLY  0x01 // The focused field rejects input
+#define ML_TEXT_FIELD_FLAG_MULTILINE  0x02 // The focused field accepts multiple lines
+#define ML_TEXT_FIELD_FLAG_SOURCE_UIA 0x04 // The classification came from UI Automation rather than Win32 styles
+
+// This callback is invoked to notify the client that the text field focus state on the
+// host has changed. It is an Apollo protocol extension and is never invoked when streaming
+// from a host that does not implement it.
+//
+// THIS CALLBACK REPORTS ABSOLUTE STATE, NOT AN EDGE: the most recent invocation always
+// describes the current host focus, so a client may act on each invocation without tracking
+// history. fieldKind is one of the ML_TEXT_FIELD_* values, flags is a mask of
+// ML_TEXT_FIELD_FLAG_* values, and inputScope is 0 unless the host reports a TSF input scope.
+typedef void(*ConnListenerSetTextFieldFocus)(uint8_t fieldKind, uint8_t flags, uint32_t inputScope);
+
 typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerStageStarting stageStarting;
     ConnListenerStageComplete stageComplete;
@@ -493,6 +514,9 @@ typedef struct _CONNECTION_LISTENER_CALLBACKS {
     ConnListenerSetMotionEventState setMotionEventState;
     ConnListenerSetControllerLED setControllerLED;
     ConnListenerSetAdaptiveTriggers setAdaptiveTriggers;
+    // New members MUST be appended here at the end of the struct. Inserting one in the
+    // middle silently breaks the ABI for every other consumer of this library.
+    ConnListenerSetTextFieldFocus setTextFieldFocus;
 } CONNECTION_LISTENER_CALLBACKS, *PCONNECTION_LISTENER_CALLBACKS;
 
 // Use this function to zero the connection callbacks when allocated on the stack or heap
