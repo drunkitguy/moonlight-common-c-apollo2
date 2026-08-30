@@ -489,6 +489,17 @@ typedef void(*ConnListenerSetControllerLED)(uint16_t controllerNumber, uint8_t r
 #define ML_TEXT_FIELD_FLAG_READ_ONLY  0x01 // The focused field rejects input
 #define ML_TEXT_FIELD_FLAG_MULTILINE  0x02 // The focused field accepts multiple lines
 #define ML_TEXT_FIELD_FLAG_SOURCE_UIA 0x04 // The classification came from UI Automation rather than Win32 styles
+// The verdict came from a best-effort keyword guess at the field's label rather than from
+// anything the application actually published. A client that has no numeric layout the user
+// can escape from may prefer to treat such a field as plain text.
+#define ML_TEXT_FIELD_FLAG_LOW_CONFIDENCE 0x08
+// The host found positive numeric evidence for this field. Redundant when fieldKind is
+// ML_TEXT_FIELD_NUMERIC; the reason it exists is ML_TEXT_FIELD_PASSWORD, where it means the
+// masked field is a numeric PIN/CVV and a numeric password layout is the right keyboard.
+#define ML_TEXT_FIELD_FLAG_NUMERIC 0x10
+
+// UNKNOWN FLAG BITS MUST BE IGNORED, NOT REJECTED. flags is a bitfield and a newer host may
+// set bits this header does not name; the payload version is not bumped for a new flag bit.
 
 // This callback is invoked to notify the client that the text field focus state on the
 // host has changed. It is an Apollo protocol extension and is never invoked when streaming
